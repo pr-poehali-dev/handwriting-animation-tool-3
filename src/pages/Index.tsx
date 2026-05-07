@@ -1,16 +1,16 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Icon from "@/components/ui/icon";
 
 type Tab = "font" | "draw" | "editor" | "animation" | "export" | "settings";
 type AspectRatio = "16:9" | "9:16" | "4:3" | "1:1";
-type AnimStyle = "stroke" | "fade" | "typewriter";
+type AnimStyle = "handwrite" | "fade" | "typewriter";
 type LineCapStyle = "round" | "square" | "butt";
-type ExportFormat = "mp4" | "webm" | "gif";
+type ExportFormat = "mp4" | "webm";
 
 interface TextLayer {
   id: string;
   text: string;
-  x: number;
+  x: number; // % of canvas
   y: number;
   fontSize: number;
   color: string;
@@ -50,7 +50,169 @@ function mkId() { return Math.random().toString(36).slice(2, 8); }
 function getPreviewDims(ratio: AspectRatio, maxW: number, maxH: number) {
   const ar = ASPECT_RATIOS.find(r => r.id === ratio)!;
   const scale = Math.min(maxW / ar.w, maxH / ar.h);
-  return { w: Math.round(ar.w * scale), h: Math.round(ar.h * scale), nativeW: ar.w, nativeH: ar.h };
+  return { w: Math.round(ar.w * scale), h: Math.round(ar.h * scale) };
+}
+
+/**
+ * Рисует один слой текста с эффектом «рукописного» появления.
+ *
+ * Принцип для "handwrite":
+ *  - Полный текст всегда занимает финальную позицию (измеряется заранее).
+ *  - Для каждого символа вычисляем его X-позицию исходя из полного текста.
+ *  - Каждый символ «прорисовывается» постепенно через strokeText с нарастающим lineWidth,
+ *    затем заливается через fillText с нарастающей прозрачностью.
+ *  - Символ начинает появляться когда progress достигает его очереди.
+ */
+function drawLayer(
+  ctx: CanvasRenderingContext2D,
+  layer: TextLayer,
+  canvasW: number,
+  canvasH: number,
+  nativeW: number,
+  nativeH: number,
+  progress: number, // 0..1
+  animStyle: AnimStyle,
+  isStatic: boolean, // без анимации — просто нарисовать всё
+) {
+  const scaleX = canvasW / nativeW;
+  const scaleY = canvasH / nativeH;
+  const scale = Math.min(scaleX, scaleY);
+  const fs = Math.round(layer.fontSize * scale);
+  const px = (layer.x / 100) * canvasW;
+  const py = (layer.y / 100) * canvasH;
+
+  const weight = layer.bold ? "bold" : "normal";
+  const style = layer.italic ? "italic" : "normal";
+  const fontStr = `${style} ${weight} ${fs}px '${layer.fontFamily}', 'Caveat', cursive`;
+  ctx.font = fontStr;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = layer.align;
+
+  const chars = layer.text.split("");
+  const n = chars.length;
+
+  if (isStatic || n === 0) {
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = layer.color;
+    ctx.fillText(layer.text, px, py);
+    return;
+  }
+
+  if (animStyle === "typewriter") {
+    // Мгновенное появление символов по очереди, без плавности
+    const visible = Math.floor(progress * n);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = layer.color;
+    // Рисуем только видимые символы, но на финальной позиции полного текста
+    // Чтобы текст не сдвигался — измеряем полную строку и рендерим подстроку
+    // с правильным отступом для align
+    const fullW = ctx.measureText(layer.text).width;
+    let startX = px;
+    if (layer.align === "center") startX = px - fullW / 2;
+    if (layer.align === "right") startX = px - fullW;
+
+    let x = startX;
+    for (let i = 0; i < n; i++) {
+      const cw = ctx.measureText(chars[i]).width;
+      if (i < visible) {
+        ctx.fillText(chars[i], x + cw / 2, py);
+      }
+      // даже непоявившиеся символы занимают место (x продвигается)
+      x += cw;
+    }
+    return;
+  }
+
+  if (animStyle === "fade") {
+    // Каждый символ плавно появляется (fade in), стоит на месте
+    const fullW = ctx.measureText(layer.text).width;
+    let startX = px;
+    if (layer.align === "center") startX = px - fullW / 2;
+    if (layer.align === "right") startX = px - fullW;
+
+    let x = startX;
+    for (let i = 0; i < n; i++) {
+      const cw = ctx.measureText(chars[i]).width;
+      // Каждый символ занимает window 1/n прогресса, с перекрытием 0.3
+      const charStart = i / n;
+      const charEnd = (i + 1.5) / n;
+      const alpha = Math.max(0, Math.min(1, (progress - charStart) / (charEnd - charStart)));
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = layer.color;
+      ctx.textAlign = "left";
+      ctx.fillText(chars[i], x, py);
+      x += cw;
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = layer.align;
+    return;
+  }
+
+  // === HANDWRITE ===
+  // Каждый символ «прорисовывается» постепенно:
+  // 1. Сначала появляется как stroke (обводка) с нарастающим dash-offset
+  // 2. Затем заполняется fill с нарастающей alpha
+  // Текст не сдвигается — все позиции вычислены по полному тексту заранее.
+
+  const fullW = ctx.measureText(layer.text).width;
+  let startX = px;
+  if (layer.align === "center") startX = px - fullW / 2;
+  if (layer.align === "right") startX = px - fullW;
+
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  let x = startX;
+  for (let i = 0; i < n; i++) {
+    const ch = chars[i];
+    const cw = ctx.measureText(ch).width;
+    const cx = x; // левый край символа
+
+    // Каждый символ: свой диапазон прогресса
+    // Символы появляются с небольшим перекрытием для плавности
+    const charProgress = (progress * n - i);
+    // charProgress: <0 = не начался, 0..0.5 = stroke фаза, 0.5..1 = fill фаза, >1 = полностью
+
+    if (charProgress <= 0) {
+      x += cw;
+      continue;
+    }
+
+    const strokePhase = Math.max(0, Math.min(1, charProgress * 2)); // 0..1 за первую половину
+    const fillPhase = Math.max(0, Math.min(1, (charProgress - 0.5) * 2)); // 0..1 за вторую
+
+    // --- Stroke reveal ---
+    // Используем clip-rect для постепенного раскрытия символа слева направо
+    ctx.save();
+    // Clip: раскрываем символ слева направо
+    const revealW = cw * strokePhase;
+    ctx.rect(cx, py - fs, revealW + fs * 0.1, fs * 2);
+    ctx.clip();
+
+    // Stroke (обводка, имитирует «перо»)
+    ctx.strokeStyle = layer.color;
+    ctx.lineWidth = Math.max(1, fs * 0.08 * (0.5 + 0.5 * strokePhase));
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.globalAlpha = Math.min(1, strokePhase * 2);
+    ctx.strokeText(ch, cx, py);
+
+    ctx.restore();
+
+    // --- Fill (финальная заливка поверх) ---
+    if (fillPhase > 0) {
+      ctx.globalAlpha = fillPhase;
+      ctx.fillStyle = layer.color;
+      ctx.fillText(ch, cx, py);
+    }
+
+    x += cw;
+  }
+
+  ctx.restore();
+  ctx.globalAlpha = 1;
+  ctx.textAlign = layer.align;
 }
 
 export default function Index() {
@@ -69,10 +231,10 @@ export default function Index() {
   const [layers, setLayers] = useState<TextLayer[]>([
     { id: mkId(), text: "Привет, мир!", x: 50, y: 50, fontSize: 72, color: "#ffffff", fontFamily: "Caveat", bold: false, italic: false, align: "center" }
   ]);
-  const [activeLayerId, setActiveLayerId] = useState<string>(layers[0].id);
+  const [activeLayerId, setActiveLayerId] = useState<string>(() => layers[0].id);
   const [draggingLayerId, setDraggingLayerId] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
-  const [animStyle, setAnimStyle] = useState<AnimStyle>("stroke");
+  const [animStyle, setAnimStyle] = useState<AnimStyle>("handwrite");
   const [speed, setSpeed] = useState(1.0);
   const [fps, setFps] = useState(30);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -82,7 +244,6 @@ export default function Index() {
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
   const [quality, setQuality] = useState<"720p" | "1080p" | "4K">("1080p");
   const [inkColor, setInkColor] = useState("#f5c842");
-  const [pressure] = useState(true);
 
   const previewRef = useRef<HTMLCanvasElement>(null);
   const drawCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -90,6 +251,18 @@ export default function Index() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const [previewSize, setPreviewSize] = useState({ w: 800, h: 450 });
+
+  // Refs for stable access inside animation loops
+  const layersRef = useRef(layers);
+  const bgColorRef = useRef(bgColor);
+  const bgTransparentRef = useRef(bgTransparent);
+  const animStyleRef = useRef(animStyle);
+  const aspectRatioRef = useRef(aspectRatio);
+  useEffect(() => { layersRef.current = layers; }, [layers]);
+  useEffect(() => { bgColorRef.current = bgColor; }, [bgColor]);
+  useEffect(() => { bgTransparentRef.current = bgTransparent; }, [bgTransparent]);
+  useEffect(() => { animStyleRef.current = animStyle; }, [animStyle]);
+  useEffect(() => { aspectRatioRef.current = aspectRatio; }, [aspectRatio]);
 
   const activeLayer = layers.find(l => l.id === activeLayerId) ?? layers[0];
 
@@ -107,90 +280,55 @@ export default function Index() {
     return () => ro.disconnect();
   }, [aspectRatio, activeTab]);
 
-  // Redraw canvas
-  const redrawPreview = useCallback((progressOverride?: number) => {
+  // Core render function — stable via refs
+  const renderFrame = useCallback((progress: number | null) => {
     const canvas = previewRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    const ar = ASPECT_RATIOS.find(r => r.id === aspectRatioRef.current)!;
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    if (!bgTransparent) {
-      ctx.fillStyle = bgColor;
+    if (!bgTransparentRef.current) {
+      ctx.fillStyle = bgColorRef.current;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
 
-    const progress = progressOverride ?? 1;
+    const isStatic = progress === null;
+    const p = progress ?? 1;
 
-    layers.forEach(layer => {
-      const scaleX = canvas.width / ASPECT_RATIOS.find(r => r.id === aspectRatio)!.w;
-      const scaleY = canvas.height / ASPECT_RATIOS.find(r => r.id === aspectRatio)!.h;
-      const px = (layer.x / 100) * canvas.width;
-      const py = (layer.y / 100) * canvas.height;
-      const fs = Math.round(layer.fontSize * Math.min(scaleX, scaleY));
-
-      const weight = layer.bold ? "bold" : "normal";
-      const style = layer.italic ? "italic" : "normal";
-      ctx.font = `${style} ${weight} ${fs}px '${layer.fontFamily}', 'Caveat', cursive`;
-      ctx.textAlign = layer.align;
-      ctx.textBaseline = "middle";
-
-      const chars = layer.text.split("");
-      const visible = Math.floor(progress * chars.length);
-
-      if (animStyle === "stroke" || progressOverride === undefined) {
-        // typewriter/stroke: show chars progressively
-        const fullText = progressOverride !== undefined ? layer.text.slice(0, visible) : layer.text;
-        ctx.fillStyle = layer.color;
-        ctx.globalAlpha = 1;
-        ctx.fillText(fullText, px, py);
-      } else if (animStyle === "fade") {
-        chars.forEach((ch, i) => {
-          if (i >= visible + 4) return;
-          const alpha = Math.max(0, Math.min(1, (progress * chars.length - i) * 0.5));
-          ctx.globalAlpha = alpha;
-          ctx.fillStyle = layer.color;
-          const measureCtx = ctx;
-          const charsBefore = layer.text.slice(0, i);
-          const charW = measureCtx.measureText(ch).width;
-          const beforeW = measureCtx.measureText(charsBefore).width;
-          const startX = layer.align === "center" ? px - measureCtx.measureText(layer.text).width / 2 : px;
-          ctx.fillText(ch, startX + beforeW + charW / 2, py);
-        });
-        ctx.globalAlpha = 1;
-      } else {
-        ctx.fillStyle = layer.color;
-        ctx.globalAlpha = 1;
-        ctx.fillText(layer.text.slice(0, visible), px, py);
-      }
+    layersRef.current.forEach(layer => {
+      drawLayer(ctx, layer, canvas.width, canvas.height, ar.w, ar.h, p, animStyleRef.current, isStatic);
     });
-    ctx.globalAlpha = 1;
-  }, [layers, bgColor, bgTransparent, aspectRatio, animStyle]);
+  }, []);
 
+  // Redraw static preview when not playing
   useEffect(() => {
-    if (!isPlaying) redrawPreview();
-  }, [redrawPreview, isPlaying]);
+    if (!isPlaying) renderFrame(null);
+  }, [layers, bgColor, bgTransparent, aspectRatio, animStyle, isPlaying, renderFrame]);
 
   // Animation loop
   const runAnimation = useCallback(() => {
-    const maxChars = Math.max(...layers.map(l => l.text.length));
-    const totalFrames = Math.round((maxChars * 18) / speed);
+    const maxChars = Math.max(...layersRef.current.map(l => l.text.length), 1);
+    const framesPerChar = Math.round(18 / speed);
+    const totalFrames = maxChars * framesPerChar;
     let frame = 0;
+
     const step = () => {
       const progress = Math.min(frame / totalFrames, 1);
       setPlayProgress(progress);
-      redrawPreview(progress);
+      renderFrame(progress);
       frame++;
       if (frame <= totalFrames + fps) {
         animFrameRef.current = requestAnimationFrame(step);
       } else {
         setIsPlaying(false);
         setPlayProgress(1);
+        renderFrame(null);
       }
     };
     animFrameRef.current = requestAnimationFrame(step);
-  }, [layers, speed, fps, redrawPreview]);
+  }, [speed, fps, renderFrame]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -201,9 +339,9 @@ export default function Index() {
       cancelAnimationFrame(animFrameRef.current);
     }
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [isPlaying]);
+  }, [isPlaying]); // eslint-disable-line
 
-  // Draw canvas redraw
+  // Draw canvas
   const redrawDrawCanvas = useCallback(() => {
     const canvas = drawCanvasRef.current;
     if (!canvas) return;
@@ -221,39 +359,33 @@ export default function Index() {
     ctx.setLineDash([]);
 
     ctx.font = `${canvas.height * 0.65}px '${fontName}', 'Caveat', cursive`;
-    ctx.fillStyle = "rgba(245,200,66,0.06)";
+    ctx.fillStyle = "rgba(245,200,66,0.07)";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(selectedChar, canvas.width / 2, canvas.height / 2);
 
-    [...strokes, currentStroke].forEach(stroke => {
+    [...strokes, currentStroke].forEach((stroke, si) => {
       if (stroke.length < 2) return;
-      ctx.beginPath();
-      ctx.strokeStyle = inkColor;
-      ctx.lineWidth = lineWidth;
-      ctx.lineCap = lineStyle;
-      ctx.lineJoin = "round";
-      ctx.moveTo(stroke[0].x, stroke[0].y);
-      if (pressure && stroke.length > 3) {
-        for (let i = 1; i < stroke.length - 1; i++) {
-          const t = i / stroke.length;
-          const w = lineWidth * (0.5 + Math.sin(t * Math.PI) * 0.5);
-          ctx.lineWidth = w;
-          ctx.lineTo(stroke[i].x, stroke[i].y);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.moveTo(stroke[i].x, stroke[i].y);
-        }
-      } else {
-        stroke.forEach(p => ctx.lineTo(p.x, p.y));
+      const total = strokes.length + (currentStroke.length > 1 ? 1 : 0);
+      // Simulate pressure: thicker in middle, thinner at ends
+      for (let i = 1; i < stroke.length; i++) {
+        const t = i / stroke.length;
+        const pressure = Math.sin(t * Math.PI); // 0→1→0
+        ctx.beginPath();
+        ctx.strokeStyle = inkColor;
+        ctx.lineWidth = lineWidth * (0.4 + 0.6 * pressure);
+        ctx.lineCap = lineStyle;
+        ctx.lineJoin = "round";
+        ctx.moveTo(stroke[i - 1].x, stroke[i - 1].y);
+        ctx.lineTo(stroke[i].x, stroke[i].y);
         ctx.stroke();
+        void si; void total;
       }
     });
-  }, [strokes, currentStroke, selectedChar, inkColor, lineWidth, lineStyle, fontName, pressure]);
+  }, [strokes, currentStroke, selectedChar, inkColor, lineWidth, lineStyle, fontName]);
 
   useEffect(() => { redrawDrawCanvas(); }, [redrawDrawCanvas]);
 
-  // Draw canvas mouse
   const getDrawPos = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const c = drawCanvasRef.current!;
     const r = c.getBoundingClientRect();
@@ -268,23 +400,16 @@ export default function Index() {
     setCurrentStroke([]);
   };
 
-  // Dragging layers on preview
-  const getPreviewPos = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // Drag layers on preview
+  const getPreviewPct = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const c = previewRef.current!;
     const r = c.getBoundingClientRect();
-    return {
-      px: ((e.clientX - r.left) / r.width) * 100,
-      py: ((e.clientY - r.top) / r.height) * 100,
-    };
+    return { px: ((e.clientX - r.left) / r.width) * 100, py: ((e.clientY - r.top) / r.height) * 100 };
   };
   const onPreviewMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (activeTab !== "editor") return;
-    const { px, py } = getPreviewPos(e);
-    const hit = [...layers].reverse().find(l => {
-      const dx = Math.abs(l.x - px);
-      const dy = Math.abs(l.y - py);
-      return dx < 15 && dy < 8;
-    });
+    const { px, py } = getPreviewPct(e);
+    const hit = [...layers].reverse().find(l => Math.abs(l.x - px) < 15 && Math.abs(l.y - py) < 8);
     if (hit) {
       setActiveLayerId(hit.id);
       setDraggingLayerId(hit.id);
@@ -293,8 +418,10 @@ export default function Index() {
   };
   const onPreviewMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!draggingLayerId) return;
-    const { px, py } = getPreviewPos(e);
-    setLayers(ls => ls.map(l => l.id === draggingLayerId ? { ...l, x: Math.max(5, Math.min(95, px - dragOffset.x)), y: Math.max(5, Math.min(95, py - dragOffset.y)) } : l));
+    const { px, py } = getPreviewPct(e);
+    setLayers(ls => ls.map(l => l.id === draggingLayerId
+      ? { ...l, x: Math.max(2, Math.min(98, px - dragOffset.x)), y: Math.max(2, Math.min(98, py - dragOffset.y)) }
+      : l));
   };
   const onPreviewMouseUp = () => setDraggingLayerId(null);
 
@@ -303,17 +430,17 @@ export default function Index() {
   };
 
   const addLayer = () => {
-    const newLayer: TextLayer = { id: mkId(), text: "Новый текст", x: 50, y: 60, fontSize: 64, color: "#ffffff", fontFamily: fontName, bold: false, italic: false, align: "center" };
-    setLayers(ls => [...ls, newLayer]);
-    setActiveLayerId(newLayer.id);
+    const nl: TextLayer = { id: mkId(), text: "Новый текст", x: 50, y: 65, fontSize: 64, color: "#ffffff", fontFamily: fontName, bold: false, italic: false, align: "center" };
+    setLayers(ls => [...ls, nl]);
+    setActiveLayerId(nl.id);
   };
 
   const removeLayer = (id: string) => {
+    const next = layers.find(l => l.id !== id);
     setLayers(ls => ls.filter(l => l.id !== id));
-    if (activeLayerId === id) setActiveLayerId(layers.find(l => l.id !== id)?.id ?? "");
+    if (activeLayerId === id && next) setActiveLayerId(next.id);
   };
 
-  // Font upload
   const handleFontUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -324,57 +451,55 @@ export default function Index() {
       setUploadedFont(name);
       setFontName(name);
       updateActiveLayer({ fontFamily: name });
+      // Switch to draw tab so user sees animation preview of new font
+      setSelectedChar("А");
+      setStrokes([]);
+      setCurrentStroke([]);
     });
   };
 
-  // Export MP4/WebM via MediaRecorder
+  // Export via MediaRecorder
   const handleExport = useCallback(async () => {
     const canvas = previewRef.current;
     if (!canvas) return;
     setIsExporting(true);
     setExportProgress(0);
 
-    const maxChars = Math.max(...layers.map(l => l.text.length));
-    const totalFrames = Math.round((maxChars * 18) / speed) + fps;
-    const mimeType = exportFormat === "mp4" ? "video/mp4" : exportFormat === "webm" ? "video/webm;codecs=vp9" : "video/webm";
+    const maxChars = Math.max(...layersRef.current.map(l => l.text.length), 1);
+    const framesPerChar = Math.round(18 / speed);
+    const totalFrames = maxChars * framesPerChar + fps;
+    const mimeType = exportFormat === "mp4"
+      ? (MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm;codecs=h264")
+      : "video/webm;codecs=vp9";
     const actualMime = MediaRecorder.isTypeSupported(mimeType) ? mimeType : "video/webm";
 
     const stream = canvas.captureStream(fps);
-    const recorder = new MediaRecorder(stream, { mimeType: actualMime, videoBitsPerSecond: 8000000 });
+    const recorder = new MediaRecorder(stream, { mimeType: actualMime, videoBitsPerSecond: 10_000_000 });
     const chunks: Blob[] = [];
-    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.ondataavailable = ev => { if (ev.data.size > 0) chunks.push(ev.data); };
     recorder.onstop = () => {
       const blob = new Blob(chunks, { type: actualMime });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url;
-      a.download = `letterflow.${exportFormat === "mp4" ? "mp4" : "webm"}`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setIsExporting(false);
-      setExportProgress(0);
+      a.href = url; a.download = `letterflow.${exportFormat === "mp4" ? "mp4" : "webm"}`;
+      a.click(); URL.revokeObjectURL(url);
+      setIsExporting(false); setExportProgress(0);
     };
 
     recorder.start();
     let frame = 0;
-    const render = () => {
-      const progress = Math.min(frame / totalFrames, 1);
-      setExportProgress(progress);
-      redrawPreview(progress);
+    const renderExport = () => {
+      const p = Math.min(frame / (totalFrames - fps), 1);
+      setExportProgress(frame / totalFrames);
+      renderFrame(p >= 1 ? null : p);
       frame++;
-      if (frame <= totalFrames) {
-        setTimeout(render, 1000 / fps);
-      } else {
-        recorder.stop();
-      }
+      if (frame <= totalFrames) setTimeout(renderExport, 1000 / fps);
+      else recorder.stop();
     };
-    render();
-  }, [layers, speed, fps, exportFormat, redrawPreview]);
+    renderExport();
+  }, [speed, fps, exportFormat, renderFrame]);
 
-  const previewAR = useMemo(() => {
-    const ar = ASPECT_RATIOS.find(r => r.id === aspectRatio)!;
-    return ar.w / ar.h;
-  }, [aspectRatio]);
+  const nativeAR = ASPECT_RATIOS.find(r => r.id === aspectRatio)!;
 
   return (
     <div className="flex flex-col h-screen bg-background overflow-hidden select-none">
@@ -385,10 +510,9 @@ export default function Index() {
             <span className="font-handwriting text-primary-foreground text-xs font-bold leading-none">Lf</span>
           </div>
           <span className="font-semibold text-sm tracking-tight">LetterFlow</span>
-          <span className="text-muted-foreground text-xs font-mono opacity-50">v0.2</span>
+          <span className="text-muted-foreground text-xs font-mono opacity-40">v0.3</span>
         </div>
         <div className="flex items-center gap-3">
-          {/* Aspect ratio */}
           <div className="flex gap-1 bg-muted rounded-lg p-1">
             {ASPECT_RATIOS.map(ar => (
               <button key={ar.id} onClick={() => setAspectRatio(ar.id)}
@@ -416,20 +540,19 @@ export default function Index() {
       {/* Body */}
       <div className="flex-1 flex overflow-hidden">
 
-        {/* =========== LEFT: PREVIEW (always visible) =========== */}
-        <div ref={previewContainerRef} className="flex-1 flex flex-col items-center justify-center bg-[#0a0a0f] overflow-hidden relative p-4">
-          {/* Checkerboard for transparent bg */}
+        {/* LEFT: Preview (always visible) */}
+        <div ref={previewContainerRef} className="flex-1 flex flex-col items-center justify-center bg-[#07070c] overflow-hidden p-4 gap-3">
           <div className="relative" style={{ width: previewSize.w, height: previewSize.h }}>
             {bgTransparent && (
-              <div className="absolute inset-0 rounded-lg overflow-hidden"
-                style={{ backgroundImage: "repeating-conic-gradient(#2a2a2a 0% 25%, #1a1a1a 0% 50%) 0 0/20px 20px" }} />
+              <div className="absolute inset-0 rounded-lg overflow-hidden pointer-events-none"
+                style={{ backgroundImage: "repeating-conic-gradient(#222 0% 25%, #111 0% 50%) 0 0/20px 20px" }} />
             )}
             <canvas
               ref={previewRef}
-              width={ASPECT_RATIOS.find(r => r.id === aspectRatio)!.w}
-              height={ASPECT_RATIOS.find(r => r.id === aspectRatio)!.h}
-              className={`absolute inset-0 w-full h-full rounded-lg ${activeTab === "editor" ? "cursor-move" : ""}`}
-              style={{ outline: "1px solid rgba(255,255,255,0.08)" }}
+              width={nativeAR.w}
+              height={nativeAR.h}
+              className={`absolute inset-0 w-full h-full rounded-lg ${activeTab === "editor" && !isPlaying ? "cursor-move" : "cursor-default"}`}
+              style={{ outline: "1px solid rgba(255,255,255,0.07)" }}
               onMouseDown={onPreviewMouseDown}
               onMouseMove={onPreviewMouseMove}
               onMouseUp={onPreviewMouseUp}
@@ -438,38 +561,61 @@ export default function Index() {
           </div>
 
           {/* Playback bar */}
-          <div className="flex items-center gap-3 mt-3 w-full max-w-[var(--preview-w,600px)]" style={{ maxWidth: previewSize.w }}>
+          <div className="flex items-center gap-3" style={{ width: previewSize.w }}>
             <button onClick={() => setIsPlaying(p => !p)}
               className="w-7 h-7 rounded-full bg-primary flex items-center justify-center hover:bg-primary/90 transition-colors shrink-0">
               <Icon name={isPlaying ? "Pause" : "Play"} size={12} className="text-primary-foreground" fallback="Circle" />
             </button>
-            <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden cursor-pointer">
+            <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden">
               <div className="h-full bg-primary rounded-full transition-all" style={{ width: `${playProgress * 100}%` }} />
             </div>
             <span className="text-xs font-mono text-muted-foreground w-8 text-right">{Math.round(playProgress * 100)}%</span>
-            <span className="text-xs font-mono text-muted-foreground opacity-40">{aspectRatio}</span>
+            <span className="text-xs font-mono text-muted-foreground/30">{aspectRatio}</span>
+          </div>
+
+          {/* Style indicator */}
+          <div className="flex gap-2">
+            {([
+              { id: "handwrite", label: "Рукопись" },
+              { id: "fade", label: "Растворение" },
+              { id: "typewriter", label: "Машинка" },
+            ] as const).map(s => (
+              <button key={s.id} onClick={() => setAnimStyle(s.id)}
+                className={`px-3 py-1 rounded-full text-xs transition-all ${animStyle === s.id ? "bg-primary text-primary-foreground" : "bg-muted/40 text-muted-foreground hover:text-foreground"}`}>
+                {s.label}
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* =========== RIGHT: PANELS =========== */}
+        {/* RIGHT: Panels */}
         <div className="w-[340px] border-l border-border flex flex-col overflow-hidden shrink-0 bg-card">
 
-          {/* ---- FONT TAB ---- */}
+          {/* FONT TAB */}
           {activeTab === "font" && (
-            <div className="flex-1 overflow-y-auto p-4 space-y-5">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Загрузить шрифт</div>
               <input ref={fileInputRef} type="file" accept=".ttf,.otf,.woff,.woff2" className="hidden" onChange={handleFontUpload} />
               <button onClick={() => fileInputRef.current?.click()}
                 className="w-full border-2 border-dashed border-border hover:border-primary/50 rounded-xl p-6 flex flex-col items-center gap-2 text-muted-foreground hover:text-foreground transition-colors">
                 <Icon name="Upload" size={24} fallback="Circle" />
                 <div className="text-sm font-medium">{uploadedFont ? `✓ ${uploadedFont}` : "TTF / OTF / WOFF"}</div>
+                <div className="text-xs opacity-50">Шрифт сохраняется в сессии</div>
               </button>
+
+              {uploadedFont && (
+                <div className="rounded-xl border border-primary/30 bg-primary/5 p-4">
+                  <div className="text-xs text-muted-foreground mb-2">Загруженный шрифт</div>
+                  <div style={{ fontFamily: uploadedFont }} className="text-3xl text-primary">Аа Бб Вв</div>
+                  <div className="text-xs font-mono text-muted-foreground mt-2">{uploadedFont}</div>
+                </div>
+              )}
 
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Встроенные</div>
               <div className="grid grid-cols-2 gap-2">
                 {BUILTIN_FONTS.map(f => (
                   <button key={f.name} onClick={() => { setFontName(f.name); updateActiveLayer({ fontFamily: f.name }); }}
-                    className={`p-3 rounded-xl border text-left transition-all ${fontName === f.name && !uploadedFont ? "border-primary bg-primary/10" : "border-border"}`}>
+                    className={`p-3 rounded-xl border text-left transition-all ${fontName === f.name && !uploadedFont ? "border-primary bg-primary/10" : "border-border hover:bg-muted/30"}`}>
                     <div style={{ fontFamily: f.name }} className="text-2xl text-foreground leading-none mb-1">Аа</div>
                     <div className="text-xs text-muted-foreground">{f.label}</div>
                   </button>
@@ -478,38 +624,36 @@ export default function Index() {
             </div>
           )}
 
-          {/* ---- DRAW TAB ---- */}
+          {/* DRAW TAB */}
           {activeTab === "draw" && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              {/* Char grid */}
-              <div className="h-40 border-b border-border overflow-y-auto p-2 shrink-0">
-                <div className="grid grid-cols-8 gap-1">
+              <div className="h-36 border-b border-border overflow-y-auto p-2 shrink-0">
+                <div className="grid grid-cols-8 gap-0.5">
                   {SAMPLE_CHARS.map(ch => (
                     <button key={ch} onClick={() => { setSelectedChar(ch); setStrokes([]); setCurrentStroke([]); }}
-                      className={`w-8 h-8 rounded text-xs font-mono transition-all ${selectedChar === ch ? "bg-primary text-primary-foreground" : "hover:bg-muted text-foreground"}`}>
+                      className={`w-7 h-7 rounded text-xs font-mono transition-all ${selectedChar === ch ? "bg-primary text-primary-foreground" : "hover:bg-muted text-foreground"}`}>
                       {ch}
                     </button>
                   ))}
                 </div>
               </div>
-              {/* Drawing canvas */}
-              <div className="flex-1 flex items-center justify-center p-3 bg-[#0a0a0f]">
+              <div className="flex-1 flex items-center justify-center p-3 bg-[#07070c]">
                 <canvas ref={drawCanvasRef} width={280} height={280}
-                  style={{ background: "#0d0f14", borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", cursor: "crosshair", width: "100%", maxWidth: 280, aspectRatio: "1/1" }}
+                  style={{ background: "#0d0f14", borderRadius: 12, border: "1px solid rgba(255,255,255,0.07)", cursor: "crosshair", width: "100%", maxWidth: 280, aspectRatio: "1/1" }}
                   onMouseDown={onDrawDown} onMouseMove={onDrawMove} onMouseUp={onDrawUp} onMouseLeave={onDrawUp} />
               </div>
-              {/* Tools */}
               <div className="p-3 border-t border-border space-y-3 shrink-0">
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-muted-foreground w-16">Толщина</span>
                   <input type="range" min={1} max={14} value={lineWidth} onChange={e => setLineWidth(+e.target.value)} className="flex-1 accent-amber-400" />
-                  <span className="text-xs font-mono text-primary w-6">{lineWidth}</span>
+                  <span className="text-xs font-mono text-primary w-5">{lineWidth}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-muted-foreground w-16">Цвет</span>
                   <input type="color" value={inkColor} onChange={e => setInkColor(e.target.value)} className="w-8 h-8 rounded border-0 cursor-pointer" />
-                  <span className="text-xs font-mono text-muted-foreground">{inkColor}</span>
-                  <button onClick={() => { setStrokes([]); setCurrentStroke([]); }} className="ml-auto text-xs text-muted-foreground hover:text-foreground flex items-center gap-1">
+                  <span className="text-xs font-mono text-muted-foreground flex-1">{inkColor}</span>
+                  <button onClick={() => { setStrokes([]); setCurrentStroke([]); }}
+                    className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1">
                     <Icon name="Trash2" size={11} fallback="Circle" />Очистить
                   </button>
                 </div>
@@ -526,26 +670,26 @@ export default function Index() {
             </div>
           )}
 
-          {/* ---- EDITOR TAB ---- */}
+          {/* EDITOR TAB */}
           {activeTab === "editor" && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              {/* Layers list */}
+              {/* Layers */}
               <div className="border-b border-border shrink-0">
                 <div className="flex items-center justify-between px-3 py-2">
                   <span className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Слои</span>
-                  <button onClick={addLayer} className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors">
+                  <button onClick={addLayer} className="flex items-center gap-1 text-xs text-primary hover:text-primary/80">
                     <Icon name="Plus" size={12} fallback="Circle" />Добавить
                   </button>
                 </div>
-                <div className="max-h-28 overflow-y-auto">
+                <div className="max-h-24 overflow-y-auto">
                   {layers.map(layer => (
                     <div key={layer.id} onClick={() => setActiveLayerId(layer.id)}
-                      className={`flex items-center gap-2 px-3 py-2 cursor-pointer transition-colors ${activeLayerId === layer.id ? "bg-primary/10 border-l-2 border-primary" : "hover:bg-muted/40 border-l-2 border-transparent"}`}>
+                      className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors ${activeLayerId === layer.id ? "bg-primary/10 border-l-2 border-primary" : "hover:bg-muted/30 border-l-2 border-transparent"}`}>
                       <Icon name="Type" size={11} fallback="Circle" className="text-muted-foreground shrink-0" />
-                      <span className="text-xs flex-1 truncate text-foreground">{layer.text || "Пустой слой"}</span>
+                      <span className="text-xs flex-1 truncate">{layer.text || "—"}</span>
                       {layers.length > 1 && (
                         <button onClick={e => { e.stopPropagation(); removeLayer(layer.id); }}
-                          className="opacity-0 group-hover:opacity-100 hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity">
+                          className="text-muted-foreground hover:text-destructive">
                           <Icon name="X" size={11} fallback="Circle" />
                         </button>
                       )}
@@ -554,28 +698,33 @@ export default function Index() {
                 </div>
               </div>
 
-              {/* Active layer properties */}
               {activeLayer && (
                 <div className="flex-1 overflow-y-auto p-3 space-y-4">
                   {/* Text */}
                   <div>
                     <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Текст</div>
-                    <textarea
-                      value={activeLayer.text}
+                    <textarea value={activeLayer.text}
                       onChange={e => updateActiveLayer({ text: e.target.value })}
                       rows={3}
-                      style={{ fontFamily: activeLayer.fontFamily, color: activeLayer.color }}
-                      className="w-full bg-muted/40 rounded-lg p-3 text-xl resize-none border border-border focus:border-primary/50 focus:outline-none transition-colors leading-relaxed"
-                      placeholder="Введите текст..."
-                    />
+                      style={{ fontFamily: activeLayer.fontFamily, color: activeLayer.color, background: "rgba(255,255,255,0.04)" }}
+                      className="w-full rounded-lg p-3 text-xl resize-none border border-border focus:border-primary/50 focus:outline-none transition-colors leading-relaxed"
+                      placeholder="Введите текст..." />
+                    <div className="flex gap-1.5 mt-2 flex-wrap">
+                      {["Привет, мир!", "С Новым годом!", "С днём рождения!"].map(s => (
+                        <button key={s} onClick={() => updateActiveLayer({ text: s })}
+                          className="px-2 py-1 text-xs border border-border rounded-full text-muted-foreground hover:text-primary hover:border-primary/50 transition-all">
+                          {s}
+                        </button>
+                      ))}
+                    </div>
                   </div>
 
                   {/* Font */}
                   <div>
                     <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Шрифт</div>
                     <select value={activeLayer.fontFamily} onChange={e => updateActiveLayer({ fontFamily: e.target.value })}
-                      className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/50">
-                      {uploadedFont && <option value={uploadedFont}>{uploadedFont} (загруженный)</option>}
+                      className="w-full bg-muted/30 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/50">
+                      {uploadedFont && <option value={uploadedFont}>{uploadedFont} ★</option>}
                       {BUILTIN_FONTS.map(f => <option key={f.name} value={f.name}>{f.name}</option>)}
                     </select>
                   </div>
@@ -586,39 +735,36 @@ export default function Index() {
                       <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Размер</div>
                       <span className="text-xs font-mono text-primary">{activeLayer.fontSize}px</span>
                     </div>
-                    <input type="range" min={12} max={300} value={activeLayer.fontSize} onChange={e => updateActiveLayer({ fontSize: +e.target.value })}
-                      className="w-full accent-amber-400" />
+                    <input type="range" min={12} max={300} value={activeLayer.fontSize}
+                      onChange={e => updateActiveLayer({ fontSize: +e.target.value })} className="w-full accent-amber-400" />
                   </div>
 
                   {/* Color */}
                   <div>
                     <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Цвет текста</div>
-                    <div className="flex items-center gap-3 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <input type="color" value={activeLayer.color} onChange={e => updateActiveLayer({ color: e.target.value })}
                         className="w-9 h-9 rounded-lg cursor-pointer border-0" />
                       {["#ffffff", "#000000", "#f5c842", "#ff6b6b", "#74c0fc", "#69db7c", "#cc5de8", "#ff922b"].map(c => (
                         <button key={c} onClick={() => updateActiveLayer({ color: c })}
-                          className={`w-6 h-6 rounded-full border-2 transition-all ${activeLayer.color === c ? "border-primary scale-110" : "border-transparent"}`}
+                          className={`w-6 h-6 rounded-full border-2 transition-all ${activeLayer.color === c ? "border-primary scale-110" : "border-border"}`}
                           style={{ background: c }} />
                       ))}
                     </div>
                   </div>
 
-                  {/* Style */}
+                  {/* Style + Align */}
                   <div>
-                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Стиль</div>
+                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Начертание</div>
                     <div className="flex gap-2">
                       <button onClick={() => updateActiveLayer({ bold: !activeLayer.bold })}
-                        className={`px-3 py-2 rounded-lg text-sm font-bold border transition-all ${activeLayer.bold ? "border-primary bg-primary text-primary-foreground" : "border-border text-foreground"}`}>
-                        B
-                      </button>
+                        className={`w-9 h-9 rounded-lg text-sm font-bold border transition-all ${activeLayer.bold ? "border-primary bg-primary text-primary-foreground" : "border-border text-foreground"}`}>B</button>
                       <button onClick={() => updateActiveLayer({ italic: !activeLayer.italic })}
-                        className={`px-3 py-2 rounded-lg text-sm italic border transition-all ${activeLayer.italic ? "border-primary bg-primary text-primary-foreground" : "border-border text-foreground"}`}>
-                        I
-                      </button>
+                        className={`w-9 h-9 rounded-lg text-sm italic border transition-all ${activeLayer.italic ? "border-primary bg-primary text-primary-foreground" : "border-border text-foreground"}`}>I</button>
+                      <div className="w-px bg-border mx-1" />
                       {(["left", "center", "right"] as const).map(a => (
                         <button key={a} onClick={() => updateActiveLayer({ align: a })}
-                          className={`flex-1 py-2 rounded-lg border text-xs transition-all ${activeLayer.align === a ? "border-primary bg-primary text-primary-foreground" : "border-border text-muted-foreground"}`}>
+                          className={`flex-1 h-9 rounded-lg border transition-all ${activeLayer.align === a ? "border-primary bg-primary text-primary-foreground" : "border-border text-muted-foreground"}`}>
                           <Icon name={a === "left" ? "AlignLeft" : a === "center" ? "AlignCenter" : "AlignRight"} size={13} fallback="Circle" className="mx-auto" />
                         </button>
                       ))}
@@ -628,59 +774,58 @@ export default function Index() {
                   {/* Position */}
                   <div>
                     <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Позиция</div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <div className="text-xs text-muted-foreground mb-1 flex justify-between"><span>X</span><span className="font-mono text-primary">{Math.round(activeLayer.x)}%</span></div>
+                        <div className="flex justify-between text-xs text-muted-foreground mb-1"><span>X</span><span className="font-mono text-primary">{Math.round(activeLayer.x)}%</span></div>
                         <input type="range" min={0} max={100} value={activeLayer.x} onChange={e => updateActiveLayer({ x: +e.target.value })} className="w-full accent-amber-400" />
                       </div>
                       <div>
-                        <div className="text-xs text-muted-foreground mb-1 flex justify-between"><span>Y</span><span className="font-mono text-primary">{Math.round(activeLayer.y)}%</span></div>
+                        <div className="flex justify-between text-xs text-muted-foreground mb-1"><span>Y</span><span className="font-mono text-primary">{Math.round(activeLayer.y)}%</span></div>
                         <input type="range" min={0} max={100} value={activeLayer.y} onChange={e => updateActiveLayer({ y: +e.target.value })} className="w-full accent-amber-400" />
                       </div>
                     </div>
-                    <div className="text-xs text-muted-foreground mt-2 opacity-60">Или перетащите текст прямо на превью</div>
-                  </div>
-
-                  {/* Quick presets */}
-                  <div>
-                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">Быстрые пресеты</div>
-                    <div className="flex flex-wrap gap-2">
-                      {[
-                        { label: "Центр", x: 50, y: 50 },
-                        { label: "Верх", x: 50, y: 15 },
-                        { label: "Низ", x: 50, y: 85 },
-                        { label: "Лево", x: 10, y: 50 },
-                      ].map(p => (
-                        <button key={p.label} onClick={() => updateActiveLayer({ x: p.x, y: p.y })}
-                          className="px-2.5 py-1 text-xs border border-border rounded-full hover:border-primary/50 text-muted-foreground hover:text-primary transition-all">
-                          {p.label}
+                    <div className="flex gap-2 mt-2 flex-wrap">
+                      {[{ l: "Центр", x: 50, y: 50 }, { l: "Верх", x: 50, y: 15 }, { l: "Низ", x: 50, y: 85 }].map(p => (
+                        <button key={p.l} onClick={() => updateActiveLayer({ x: p.x, y: p.y })}
+                          className="px-2.5 py-1 text-xs border border-border rounded-full text-muted-foreground hover:text-primary hover:border-primary/50 transition-all">
+                          {p.l}
                         </button>
                       ))}
                     </div>
+                    <div className="text-xs text-muted-foreground mt-1.5 opacity-50">Или перетащите текст на превью</div>
                   </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* ---- ANIMATION TAB ---- */}
+          {/* ANIMATION TAB */}
           {activeTab === "animation" && (
             <div className="flex-1 overflow-y-auto p-4 space-y-5">
-              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Стиль</div>
+              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Стиль появления</div>
               <div className="space-y-2">
                 {([
-                  { id: "stroke", label: "Рукопись", desc: "Штрих за штрихом", icon: "PenLine" },
-                  { id: "fade", label: "Растворение", desc: "Плавное появление", icon: "Sparkles" },
-                  { id: "typewriter", label: "Машинка", desc: "Посимвольный вывод", icon: "Monitor" },
+                  {
+                    id: "handwrite", label: "Рукопись", icon: "PenLine",
+                    desc: "Каждый символ прорисовывается постепенно — обводка → заливка. Как пишет человек."
+                  },
+                  {
+                    id: "fade", label: "Растворение", icon: "Sparkles",
+                    desc: "Символы плавно появляются из прозрачности. Текст стоит на месте."
+                  },
+                  {
+                    id: "typewriter", label: "Машинка", icon: "Monitor",
+                    desc: "Символы появляются мгновенно один за другим. Как печатный текст."
+                  },
                 ] as const).map(s => (
                   <button key={s.id} onClick={() => setAnimStyle(s.id)}
-                    className={`w-full flex items-center gap-3 p-3 rounded-xl border text-left transition-all ${animStyle === s.id ? "border-primary bg-primary/10" : "border-border hover:bg-muted/30"}`}>
-                    <Icon name={s.icon} size={16} fallback="Circle" className={animStyle === s.id ? "text-primary" : "text-muted-foreground"} />
-                    <div>
+                    className={`w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all ${animStyle === s.id ? "border-primary bg-primary/10" : "border-border hover:bg-muted/20"}`}>
+                    <Icon name={s.icon} size={16} fallback="Circle" className={`mt-0.5 shrink-0 ${animStyle === s.id ? "text-primary" : "text-muted-foreground"}`} />
+                    <div className="flex-1">
                       <div className="text-sm font-medium">{s.label}</div>
-                      <div className="text-xs text-muted-foreground">{s.desc}</div>
+                      <div className="text-xs text-muted-foreground mt-0.5 leading-relaxed">{s.desc}</div>
                     </div>
-                    {animStyle === s.id && <Icon name="Check" size={14} className="ml-auto text-primary" fallback="Circle" />}
+                    {animStyle === s.id && <Icon name="Check" size={14} className="text-primary mt-0.5 shrink-0" fallback="Circle" />}
                   </button>
                 ))}
               </div>
@@ -696,25 +841,31 @@ export default function Index() {
               <div className="flex gap-2">
                 {[24, 30, 60].map(f => (
                   <button key={f} onClick={() => setFps(f)}
-                    className={`flex-1 py-2 rounded-lg text-xs font-mono border transition-all ${fps === f ? "border-primary bg-primary text-primary-foreground" : "border-border hover:bg-muted text-foreground"}`}>
+                    className={`flex-1 py-2 rounded-lg text-xs font-mono border transition-all ${fps === f ? "border-primary bg-primary text-primary-foreground" : "border-border text-foreground"}`}>
                     {f}
                   </button>
                 ))}
               </div>
+
+              <button onClick={() => setIsPlaying(p => !p)}
+                className="w-full py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm flex items-center justify-center gap-2 hover:bg-primary/90 transition-colors">
+                <Icon name={isPlaying ? "Pause" : "Play"} size={14} fallback="Circle" />
+                {isPlaying ? "Пауза" : "Воспроизвести"}
+              </button>
             </div>
           )}
 
-          {/* ---- EXPORT TAB ---- */}
+          {/* EXPORT TAB */}
           {activeTab === "export" && (
-            <div className="flex-1 overflow-y-auto p-4 space-y-5">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Формат кадра</div>
               <div className="grid grid-cols-2 gap-2">
                 {ASPECT_RATIOS.map(ar => (
                   <button key={ar.id} onClick={() => setAspectRatio(ar.id)}
-                    className={`p-3 rounded-xl border text-left transition-all ${aspectRatio === ar.id ? "border-primary bg-primary/10" : "border-border"}`}>
+                    className={`p-3 rounded-xl border text-left transition-all ${aspectRatio === ar.id ? "border-primary bg-primary/10" : "border-border hover:bg-muted/20"}`}>
                     <div className={`text-sm font-mono font-bold ${aspectRatio === ar.id ? "text-primary" : "text-foreground"}`}>{ar.id}</div>
-                    <div className="text-xs text-muted-foreground mt-0.5">{ar.label}</div>
-                    <div className="text-xs font-mono text-muted-foreground/60">{ar.w}×{ar.h}</div>
+                    <div className="text-xs text-muted-foreground">{ar.label}</div>
+                    <div className="text-xs font-mono text-muted-foreground/50">{ar.w}×{ar.h}</div>
                   </button>
                 ))}
               </div>
@@ -730,14 +881,13 @@ export default function Index() {
               </div>
 
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Формат файла</div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="flex gap-2">
                 {([
-                  { id: "mp4", label: "MP4", desc: "H.264" },
-                  { id: "webm", label: "WebM", desc: "VP9" },
-                  { id: "gif", label: "GIF", desc: "Анимация" },
+                  { id: "mp4", label: "MP4", desc: "Универсальный" },
+                  { id: "webm", label: "WebM", desc: "Веб / VP9" },
                 ] as const).map(f => (
                   <button key={f.id} onClick={() => setExportFormat(f.id)}
-                    className={`p-3 rounded-xl border text-center transition-all ${exportFormat === f.id ? "border-primary bg-primary/10" : "border-border"}`}>
+                    className={`flex-1 p-3 rounded-xl border text-center transition-all ${exportFormat === f.id ? "border-primary bg-primary/10" : "border-border"}`}>
                     <div className={`text-sm font-mono font-bold ${exportFormat === f.id ? "text-primary" : "text-foreground"}`}>{f.label}</div>
                     <div className="text-xs text-muted-foreground">{f.desc}</div>
                   </button>
@@ -745,13 +895,13 @@ export default function Index() {
               </div>
 
               {/* Summary */}
-              <div className="rounded-xl border border-border p-4 bg-muted/20 space-y-2">
+              <div className="rounded-xl border border-border p-3 bg-muted/10 space-y-1.5">
                 {[
-                  { l: "Кадр", v: aspectRatio },
-                  { l: "Разрешение", v: `${ASPECT_RATIOS.find(r => r.id === aspectRatio)!.w}×${ASPECT_RATIOS.find(r => r.id === aspectRatio)!.h}` },
-                  { l: "FPS", v: fps },
+                  { l: "Кадр", v: `${aspectRatio} · ${nativeAR.w}×${nativeAR.h}` },
+                  { l: "FPS", v: String(fps) },
+                  { l: "Стиль", v: animStyle === "handwrite" ? "Рукопись" : animStyle === "fade" ? "Растворение" : "Машинка" },
                   { l: "Скорость", v: `${speed.toFixed(1)}×` },
-                  { l: "Слоёв", v: layers.length },
+                  { l: "Слоёв", v: String(layers.length) },
                 ].map(row => (
                   <div key={row.l} className="flex justify-between text-xs">
                     <span className="text-muted-foreground">{row.l}</span>
@@ -762,8 +912,8 @@ export default function Index() {
 
               {isExporting ? (
                 <div className="space-y-2">
-                  <div className="flex justify-between text-xs text-muted-foreground">
-                    <span>Рендеринг...</span>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-muted-foreground">Рендеринг...</span>
                     <span className="font-mono text-primary">{Math.round(exportProgress * 100)}%</span>
                   </div>
                   <div className="h-2 bg-muted rounded-full overflow-hidden">
@@ -774,13 +924,13 @@ export default function Index() {
                 <button onClick={handleExport}
                   className="w-full py-3.5 rounded-xl bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 transition-all flex items-center justify-center gap-2">
                   <Icon name="Download" size={16} fallback="Circle" />
-                  Рендерить и скачать {exportFormat.toUpperCase()}
+                  Скачать {exportFormat.toUpperCase()}
                 </button>
               )}
             </div>
           )}
 
-          {/* ---- SETTINGS TAB ---- */}
+          {/* SETTINGS TAB */}
           {activeTab === "settings" && (
             <div className="flex-1 overflow-y-auto p-4 space-y-5">
               <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Фон</div>
@@ -788,7 +938,7 @@ export default function Index() {
                 <div className="flex items-center justify-between p-3">
                   <div>
                     <div className="text-sm font-medium">Прозрачный фон</div>
-                    <div className="text-xs text-muted-foreground">Экспорт с альфа-каналом</div>
+                    <div className="text-xs text-muted-foreground">Альфа-канал в экспорте</div>
                   </div>
                   <button onClick={() => setBgTransparent(p => !p)}
                     className={`w-10 h-5 rounded-full transition-all relative shrink-0 ${bgTransparent ? "bg-primary" : "bg-border"}`}>
@@ -798,7 +948,7 @@ export default function Index() {
                 {!bgTransparent && (
                   <div className="p-3">
                     <div className="text-xs text-muted-foreground mb-2">Цвет фона</div>
-                    <div className="flex items-center gap-3 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <input type="color" value={bgColor} onChange={e => setBgColor(e.target.value)}
                         className="w-9 h-9 rounded-lg cursor-pointer border-0" />
                       {["#000000", "#ffffff", "#0d0f14", "#1a1a2e", "#0f2027", "#1e1e2e"].map(c => (
@@ -811,26 +961,25 @@ export default function Index() {
                 )}
               </div>
 
-              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Обрисовка</div>
+              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Инструмент обрисовки</div>
               <div className="rounded-xl border border-border divide-y divide-border overflow-hidden">
                 <div className="p-3 flex items-center gap-3">
                   <span className="text-sm flex-1">Цвет штриха</span>
                   <input type="color" value={inkColor} onChange={e => setInkColor(e.target.value)} className="w-8 h-8 rounded cursor-pointer border-0" />
-                  <span className="text-xs font-mono text-muted-foreground">{inkColor}</span>
                 </div>
                 <div className="p-3">
                   <div className="flex justify-between mb-2">
-                    <span className="text-sm">Толщина линии</span>
+                    <span className="text-sm">Толщина</span>
                     <span className="text-xs font-mono text-primary">{lineWidth}px</span>
                   </div>
                   <input type="range" min={1} max={14} value={lineWidth} onChange={e => setLineWidth(+e.target.value)} className="w-full accent-amber-400" />
                 </div>
               </div>
 
-              <div className="rounded-xl border border-border p-4 bg-muted/20">
+              <div className="rounded-xl border border-border p-4 bg-muted/10">
                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest mb-2">О программе</div>
-                <div className="text-sm text-muted-foreground">LetterFlow v0.2</div>
-                <div className="text-xs font-mono text-muted-foreground/50 mt-1">Рукописная анимация текста</div>
+                <div className="text-sm text-muted-foreground">LetterFlow v0.3</div>
+                <div className="text-xs font-mono text-muted-foreground/40 mt-1">Рукописная анимация текста</div>
               </div>
             </div>
           )}
