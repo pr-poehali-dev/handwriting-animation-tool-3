@@ -53,36 +53,37 @@ function getPreviewDims(ratio: AspectRatio, maxW: number, maxH: number) {
   return { w: Math.round(ar.w * scale), h: Math.round(ar.h * scale) };
 }
 
+// ─── Кеши для handwrite анимации ──────────────────────────────────────────────
+// Ключ: `${char}|${fontStr}`
+// Значение: массив «штрихов» — каждый штрих это непрерывная полилиния точек
+const strokeCache = new Map<string, Array<Array<{ x: number; y: number }>>>();
+// Offscreen canvas с символом (для clip-рендера)
+const offscreenCache = new Map<string, { canvas: HTMLCanvasElement; padX: number; midY: number }>();
+
 /**
- * HANDWRITE ANIMATION — правильный подход:
+ * Строим скелет буквы через медиальную ось (thinning).
  *
- * Для каждого символа:
- * 1. Рендерим его в offscreen canvas точно тем же шрифтом (fillText, без изменений)
- * 2. Сканируем пиксели и строим «траекторию пера» — упорядоченный список точек,
- *    которые перо должно пройти чтобы нарисовать букву.
- * 3. Во время анимации: уже пройденные пиксели остаются видимыми (через offscreen clip),
- *    финальный результат — точно тот же fillText.
+ * Алгоритм:
+ * 1. Рендерим символ в offscreen canvas.
+ * 2. Получаем бинарную маску заполненных пикселей.
+ * 3. Итеративно убираем граничные пиксели (Zhang-Suen thinning) — получаем 1px-скелет.
+ * 4. Из скелета извлекаем связные штрихи (DFS по 8-связности).
+ * 5. Штрихи упорядочиваются слева направо, как при реальном письме.
  *
- * Траектория строится алгоритмом Рамера-Дугласа-Пекера для сглаживания +
- * сортировка отрезков по близости (greedy nearest-neighbor).
- * Это даёт порядок штрихов максимально похожий на реальный почерк.
+ * Результат: массив штрихов, каждый штрих — полилиния центральной оси буквы.
+ * Шрифт при анимации НЕ меняется — используется только для clip-маски.
  */
-
-// Кеш: ключ → упорядоченный список точек пути пера
-const penPathCache = new Map<string, { x: number; y: number }[]>();
-
-function buildPenPath(ch: string, fontStr: string, fs: number): { x: number; y: number }[] {
+function buildStrokes(ch: string, fontStr: string, fs: number): Array<Array<{ x: number; y: number }>> {
   const key = `${ch}|${fontStr}`;
-  if (penPathCache.has(key)) return penPathCache.get(key)!;
+  if (strokeCache.has(key)) return strokeCache.get(key)!;
 
-  // Размер offscreen
-  const PAD = 4;
-  const W = Math.ceil(fs * 1.6) + PAD * 2;
-  const H = Math.ceil(fs * 1.4) + PAD * 2;
+  const PAD = Math.ceil(fs * 0.2);
+  const W = Math.ceil(fs * 1.8) + PAD * 2;
+  const H = Math.ceil(fs * 1.6) + PAD * 2;
 
   const off = document.createElement("canvas");
   off.width = W; off.height = H;
-  const oc = off.getContext("2d")!;
+  const oc = off.getContext("2d", { willReadFrequently: true })!;
   oc.clearRect(0, 0, W, H);
   oc.font = fontStr;
   oc.textBaseline = "middle";
@@ -90,127 +91,182 @@ function buildPenPath(ch: string, fontStr: string, fs: number): { x: number; y: 
   oc.fillStyle = "#fff";
   oc.fillText(ch, PAD, H / 2);
 
-  const imgData = oc.getImageData(0, 0, W, H);
-  const alpha = imgData.data;
-  const isFilled = (x: number, y: number) =>
-    x >= 0 && y >= 0 && x < W && y < H && alpha[(y * W + x) * 4 + 3] > 24;
+  const raw = oc.getImageData(0, 0, W, H).data;
+  // Бинарная маска: true = заполнен
+  const grid: Uint8Array = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) grid[i] = raw[i * 4 + 3] > 48 ? 1 : 0;
 
-  // Шаг сканирования: достаточно мелкий для качества, не слишком мелкий для скорости
-  const step = Math.max(1, Math.floor(fs / 40));
+  const idx = (x: number, y: number) => y * W + x;
+  const g = (x: number, y: number) => (x >= 0 && y >= 0 && x < W && y < H) ? grid[idx(x, y)] : 0;
 
-  // Собираем горизонтальные отрезки (сегменты) построчно
-  type Seg = { x1: number; x2: number; xMid: number; y: number; used: boolean };
-  const segs: Seg[] = [];
+  // ── Zhang-Suen thinning ──────────────────────────────────────────
+  // Упрощённая версия: итеративно снимаем граничные пиксели пока скелет не стабилизируется
+  let changed = true;
+  const toRemove: number[] = [];
 
-  for (let y = step; y < H - step; y += step) {
-    let start = -1;
-    for (let x = 0; x <= W; x++) {
-      if (isFilled(x, y) && start < 0) { start = x; }
-      else if (!isFilled(x, y) && start >= 0) {
-        segs.push({ x1: start, x2: x - 1, xMid: (start + x - 1) / 2, y, used: false });
-        start = -1;
+  const neighbors8 = (x: number, y: number) => [
+    g(x,y-1), g(x+1,y-1), g(x+1,y), g(x+1,y+1),
+    g(x,y+1), g(x-1,y+1), g(x-1,y), g(x-1,y-1),
+  ];
+
+  const transitions = (ns: number[]) => {
+    let t = 0;
+    for (let i = 0; i < 8; i++) if (ns[i] === 0 && ns[(i+1)%8] === 1) t++;
+    return t;
+  };
+
+  for (let iter = 0; iter < 40 && changed; iter++) {
+    changed = false;
+    // Проход 1
+    toRemove.length = 0;
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        if (!grid[idx(x,y)]) continue;
+        const ns = neighbors8(x, y);
+        const sum = ns.reduce((a, b) => a + b, 0);
+        if (sum < 2 || sum > 6) continue;
+        if (transitions(ns) !== 1) continue;
+        if (ns[0] * ns[2] * ns[4] !== 0) continue;
+        if (ns[2] * ns[4] * ns[6] !== 0) continue;
+        toRemove.push(idx(x, y));
       }
+    }
+    for (const i of toRemove) { grid[i] = 0; changed = true; }
+
+    // Проход 2
+    toRemove.length = 0;
+    for (let y = 1; y < H - 1; y++) {
+      for (let x = 1; x < W - 1; x++) {
+        if (!grid[idx(x,y)]) continue;
+        const ns = neighbors8(x, y);
+        const sum = ns.reduce((a, b) => a + b, 0);
+        if (sum < 2 || sum > 6) continue;
+        if (transitions(ns) !== 1) continue;
+        if (ns[0] * ns[2] * ns[6] !== 0) continue;
+        if (ns[0] * ns[4] * ns[6] !== 0) continue;
+        toRemove.push(idx(x, y));
+      }
+    }
+    for (const i of toRemove) { grid[i] = 0; changed = true; }
+  }
+
+  // ── Извлекаем штрихи из скелета (DFS по 8-связности) ──────────────
+  const visited = new Uint8Array(W * H);
+  const dirs8 = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,-1],[-1,1],[1,1]];
+
+  // Находим концевые точки скелета (соседей ровно 1) — начинаем DFS оттуда
+  const endpoints: Array<{ x: number; y: number }> = [];
+  const skeletonPts: Array<{ x: number; y: number }> = [];
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (!grid[idx(x, y)]) continue;
+      skeletonPts.push({ x, y });
+      let cnt = 0;
+      for (const [dx, dy] of dirs8) if (g(x+dx, y+dy)) cnt++;
+      if (cnt === 1) endpoints.push({ x, y });
     }
   }
 
-  if (segs.length === 0) {
-    penPathCache.set(key, []);
+  if (skeletonPts.length === 0) {
+    strokeCache.set(key, []);
+    offscreenCache.set(key, { canvas: off, padX: PAD, midY: H / 2 });
     return [];
   }
 
-  // Строим путь пера: связываем сегменты в цепочки (как реальный почерк)
-  // Алгоритм: greedy nearest-neighbor по ближайшему незаполненному сегменту
-  // Направление чередуется (зигзаг) чтобы перо не возвращалось.
-  const path: { x: number; y: number }[] = [];
+  // Если нет концевых точек (замкнутые кривые типа «о»), берём любую точку скелета
+  const starts = endpoints.length > 0 ? endpoints : [skeletonPts[0]];
 
-  // Начинаем с самого левого сегмента верхней строки
-  segs.sort((a, b) => a.y - b.y || a.x1 - b.x1);
-  let curX = segs[0].x1;
-  let curY = segs[0].y;
-  let goRight = true;
+  const strokes: Array<Array<{ x: number; y: number }>> = [];
 
-  // Группируем по строкам для быстрого поиска
-  const byRow = new Map<number, Seg[]>();
-  for (const s of segs) {
-    const row = Math.round(s.y / step);
-    if (!byRow.has(row)) byRow.set(row, []);
-    byRow.get(row)!.push(s);
-  }
+  const traceFrom = (sx: number, sy: number) => {
+    if (visited[idx(sx, sy)]) return;
+    const stroke: Array<{ x: number; y: number }> = [];
+    const stack: Array<{ x: number; y: number }> = [{ x: sx, y: sy }];
 
-  const visited = new Set<Seg>();
+    while (stack.length > 0) {
+      const { x, y } = stack.pop()!;
+      if (visited[idx(x, y)] || !grid[idx(x, y)]) continue;
+      visited[idx(x, y)] = 1;
+      stroke.push({ x, y });
 
-  const findNearest = (fromX: number, fromY: number): Seg | null => {
-    // Ищем в ближайших строках
-    const rowNow = Math.round(fromY / step);
-    let best: Seg | null = null;
-    let bestDist = Infinity;
-    for (let dr = 0; dr <= 3; dr++) {
-      for (const row of [rowNow + dr, rowNow - dr]) {
-        const rowSegs = byRow.get(row) ?? [];
-        for (const s of rowSegs) {
-          if (visited.has(s)) continue;
-          const dist = Math.hypot(s.xMid - fromX, s.y - fromY);
-          if (dist < bestDist) { bestDist = dist; best = s; }
-        }
+      // Добавляем не посещённых соседей — предпочитаем «прямое» направление
+      const unvisited = dirs8
+        .map(([dx, dy]) => ({ x: x+dx, y: y+dy }))
+        .filter(p => p.x >= 0 && p.y >= 0 && p.x < W && p.y < H && grid[idx(p.x,p.y)] && !visited[idx(p.x,p.y)]);
+
+      // Сортируем: продолжаем в направлении предыдущего движения (меньше зигзагов)
+      if (stroke.length >= 2 && unvisited.length > 1) {
+        const prev = stroke[stroke.length - 2];
+        const cur = stroke[stroke.length - 1];
+        const vx = cur.x - prev.x, vy = cur.y - prev.y;
+        unvisited.sort((a, b) => {
+          const da = Math.abs((a.x - cur.x) - vx) + Math.abs((a.y - cur.y) - vy);
+          const db = Math.abs((b.x - cur.x) - vx) + Math.abs((b.y - cur.y) - vy);
+          return da - db;
+        });
       }
-      if (best && bestDist < fs * 0.8) break;
+
+      // Push в обратном порядке (DFS — первый будет обработан первым)
+      for (let i = unvisited.length - 1; i >= 0; i--) stack.push(unvisited[i]);
     }
-    return best;
+
+    if (stroke.length >= 2) strokes.push(stroke);
   };
 
-  let iterations = 0;
-  while (iterations < segs.length * 2) {
-    iterations++;
-    const seg = findNearest(curX, curY);
-    if (!seg) break;
-    visited.add(seg);
+  // Обходим от всех концевых точек
+  for (const s of starts) traceFrom(s.x, s.y);
+  // Не забываем несвязные части (внутренние петли)
+  for (const p of skeletonPts) traceFrom(p.x, p.y);
 
-    // Добавляем точки отрезка в путь (направление зигзагом)
-    if (goRight) {
-      path.push({ x: seg.x1, y: seg.y });
-      path.push({ x: seg.x2, y: seg.y });
-      curX = seg.x2;
-    } else {
-      path.push({ x: seg.x2, y: seg.y });
-      path.push({ x: seg.x1, y: seg.y });
-      curX = seg.x1;
+  // ── Упорядочиваем штрихи как при реальном письме ──────────────────
+  // Соединяем штрихи в порядке: greedy nearest-end, слева направо
+  const ordered: Array<Array<{ x: number; y: number }>> = [];
+  const usedSet = new Set<number>();
+  let curX = 0, curY = H / 2;
+
+  while (ordered.length < strokes.length) {
+    let bestI = -1, bestDist = Infinity, bestReverse = false;
+    for (let i = 0; i < strokes.length; i++) {
+      if (usedSet.has(i)) continue;
+      const s = strokes[i];
+      const d1 = Math.hypot(s[0].x - curX, s[0].y - curY);
+      const d2 = Math.hypot(s[s.length-1].x - curX, s[s.length-1].y - curY);
+      if (d1 < bestDist) { bestDist = d1; bestI = i; bestReverse = false; }
+      if (d2 < bestDist) { bestDist = d2; bestI = i; bestReverse = true; }
     }
-    curY = seg.y;
-    goRight = !goRight;
+    if (bestI < 0) break;
+    usedSet.add(bestI);
+    const st = bestReverse ? [...strokes[bestI]].reverse() : strokes[bestI];
+    ordered.push(st);
+    curX = st[st.length-1].x;
+    curY = st[st.length-1].y;
   }
 
-  penPathCache.set(key, path);
-  return path;
+  // ── Сглаживание каждого штриха (скользящее среднее) ──────────────
+  const smooth = (pts: Array<{ x: number; y: number }>, passes = 2) => {
+    let arr = pts;
+    for (let p = 0; p < passes; p++) {
+      const out = [arr[0]];
+      for (let i = 1; i < arr.length - 1; i++) {
+        out.push({ x: (arr[i-1].x + arr[i].x * 2 + arr[i+1].x) / 4, y: (arr[i-1].y + arr[i].y * 2 + arr[i+1].y) / 4 });
+      }
+      out.push(arr[arr.length-1]);
+      arr = out;
+    }
+    return arr;
+  };
+
+  const final = ordered.map(s => smooth(s, 3));
+
+  // Сохраняем offscreen для clip-рендера
+  // Перерисовываем с правильным цветом (белый, для compositing)
+  offscreenCache.set(key, { canvas: off, padX: PAD, midY: H / 2 });
+  strokeCache.set(key, final);
+  return final;
 }
 
-/**
- * Создаёт offscreen canvas с символом и возвращает его.
- * Кешируется отдельно чтобы не перерисовывать каждый кадр.
- */
-const charOffscreenCache = new Map<string, { canvas: HTMLCanvasElement; padX: number; midY: number }>();
-
-function getCharOffscreen(ch: string, fontStr: string, fs: number) {
-  const key = `${ch}|${fontStr}`;
-  if (charOffscreenCache.has(key)) return charOffscreenCache.get(key)!;
-
-  const PAD = 4;
-  const W = Math.ceil(fs * 1.6) + PAD * 2;
-  const H = Math.ceil(fs * 1.4) + PAD * 2;
-  const off = document.createElement("canvas");
-  off.width = W; off.height = H;
-  const oc = off.getContext("2d")!;
-  oc.clearRect(0, 0, W, H);
-  oc.font = fontStr;
-  oc.textBaseline = "middle";
-  oc.textAlign = "left";
-  oc.fillStyle = "#fff";
-  oc.fillText(ch, PAD, H / 2);
-
-  const res = { canvas: off, padX: PAD, midY: H / 2 };
-  charOffscreenCache.set(key, res);
-  return res;
-}
-
+// ─── drawLayer ─────────────────────────────────────────────────────────────────
 function drawLayer(
   ctx: CanvasRenderingContext2D,
   layer: TextLayer,
@@ -239,13 +295,13 @@ function drawLayer(
   const chars = layer.text.split("");
   const n = chars.length;
 
-  // Вычисляем начальную X (фиксированная, не двигается)
+  // Фиксированная начальная X — текст никогда не сдвигается
   const fullW = ctx.measureText(layer.text).width;
   let startX = px;
   if (layer.align === "center") startX = px - fullW / 2;
   if (layer.align === "right") startX = px - fullW;
 
-  // ── Статик / завершено ──
+  // ── Статик (без анимации) ──
   if (isStatic || n === 0) {
     ctx.globalAlpha = 1;
     ctx.fillStyle = layer.color;
@@ -272,7 +328,7 @@ function drawLayer(
   if (animStyle === "fade") {
     let x = startX;
     for (let i = 0; i < n; i++) {
-      const cs = i / n, ce = (i + 1.5) / n;
+      const cs = i / n, ce = (i + 1.8) / n;
       const alpha = Math.max(0, Math.min(1, (progress - cs) / (ce - cs)));
       ctx.globalAlpha = alpha;
       ctx.fillStyle = layer.color;
@@ -284,18 +340,26 @@ function drawLayer(
     return;
   }
 
-  // ── HANDWRITE ──
-  // Каждый символ пишется отдельно:
-  //   • Уже написанные → fillText (шрифт не меняется, 100% идентичен финалу)
-  //   • Текущий символ → clip-маска из offscreen пикселей, раскрываемая по траектории пера
+  // ── HANDWRITE ──────────────────────────────────────────────────────────
   //
-  // Траектория пера строится один раз (кеш) и воспроизводится как движущееся пятно,
-  // которое «раскрывает» финальный fillText слева направо и сверху вниз.
+  // Принцип:
+  //  • Уже написанные символы → чистый fillText (шрифт идентичен финалу)
+  //  • Текущий символ → рисуем его скелетные штрихи пером (ctx.stroke),
+  //    а поверх по мере завершения проявляем финальный fillText через alpha-blend.
+  //
+  // Скелет строится через Zhang-Suen thinning → 1px центральная ось буквы.
+  // Штрихи упорядочены как при реальном письме (greedy nearest-end).
+  // Каждый штрих рисуется как ОДНА непрерывная линия — не параллельно!
+  // Между штрихами — «перелёт» пера (невидимый переход).
+  //
+  // Финальный переход: при curP > 0.85 плавно подмешиваем fillText
+  // чтобы убрать артефакты скелета и получить идеальное финальное изображение.
 
+  // Глобальный прогресс по всем символам
   const charProgress = progress * n;
-  const doneCount = Math.floor(charProgress);
-  const curIdx = Math.min(doneCount, n - 1);
-  const curP = Math.max(0, charProgress - doneCount); // 0..1 прогресс текущего символа
+  const doneCount = Math.floor(charProgress);       // полностью написанных
+  const curIdx = Math.min(doneCount, n - 1);        // индекс текущего символа
+  const curP = Math.max(0, charProgress - doneCount); // 0..1 внутри текущего символа
 
   // 1. Готовые символы — чистый fillText
   ctx.globalAlpha = 1;
@@ -306,26 +370,22 @@ function drawLayer(
     cx += ctx.measureText(chars[i]).width;
   }
 
-  // 2. Текущий символ — анимированная прорисовка
-  if (curIdx < n && (curP > 0 || doneCount === 0)) {
-    // Позиция левого края текущего символа
+  // 2. Текущий символ
+  if (curIdx < n) {
     let charStartX = startX;
     for (let i = 0; i < curIdx; i++) charStartX += ctx.measureText(chars[i]).width;
 
     const ch = chars[curIdx];
-    if (ch.trim() === "") {
-      // Пробел — просто переходим
-      ctx.restore();
-      return;
-    }
 
-    // Получаем траекторию пера и offscreen с символом
-    const penPath = buildPenPath(ch, fontStr, fs);
-    const offInfo = getCharOffscreen(ch, fontStr, fs);
+    // Пробел — молча пропускаем
+    if (ch.trim() === "") { ctx.restore(); return; }
 
-    if (penPath.length < 2) {
-      // Символ без пути (редкость) — fade
-      ctx.globalAlpha = curP;
+    const strokes = buildStrokes(ch, fontStr, fs);
+    const offInfo = offscreenCache.get(`${ch}|${fontStr}`);
+
+    // Нет скелета (редкие символы) — плавный fade
+    if (strokes.length === 0 || !offInfo) {
+      ctx.globalAlpha = Math.min(1, curP * 2);
       ctx.fillStyle = layer.color;
       ctx.fillText(ch, charStartX, py);
       ctx.globalAlpha = 1;
@@ -333,44 +393,122 @@ function drawLayer(
       return;
     }
 
-    // Сколько точек пути пройдено
-    const totalPts = penPath.length;
-    const drawnPts = Math.max(1, Math.floor(curP * totalPts));
+    // Суммарная длина всех штрихов в точках
+    const totalPts = strokes.reduce((s, st) => s + st.length, 0);
+    // Дробное количество пройденных точек с высокой точностью
+    const drawnF = curP * totalPts;
 
-    // Строим clip-маску: объединение кружков вдоль пройденного пути пера
-    // Радиус кружка = fs * 0.35 — достаточно чтобы перекрывать соседние точки
-    // Это создаёт эффект «пятна» которое раскрывает символ
-    const penR = fs * 0.38;
+    // Толщина пера — немного уже буквы, чтобы не выходить за контур
+    const penW = Math.max(1.2, fs * 0.07);
+    // Перо раскрывает букву — для clip используем радиус чуть больше пера
+    const revealR = penW * 1.6;
 
+    // Offscreen координаты → canvas координаты
+    const toCanvas = (pt: { x: number; y: number }) => ({
+      cx: charStartX + (pt.x - offInfo.padX),
+      cy: py + (pt.y - offInfo.midY),
+    });
+
+    // ── Рисуем штрихи пера (скелет) ──
+    // Используем clip от offscreen чтобы рисовать ТОЛЬКО внутри буквы
+    // и при этом не менять сам шрифт
     ctx.save();
+
+    // Clip: пятно вдоль пройденного пути пера раскрывает символ
     ctx.beginPath();
-    for (let pi = 0; pi < drawnPts; pi++) {
-      const pt = penPath[pi];
-      // Переводим координаты offscreen → canvas
-      const canvasX = charStartX + (pt.x - offInfo.padX);
-      const canvasY = py + (pt.y - offInfo.midY);
-      ctx.moveTo(canvasX + penR, canvasY);
-      ctx.arc(canvasX, canvasY, penR, 0, Math.PI * 2);
+    let ptsLeft = drawnF;
+    for (const stroke of strokes) {
+      if (ptsLeft <= 0) break;
+      const visible = Math.min(stroke.length, Math.ceil(ptsLeft));
+      for (let pi = 0; pi < visible; pi++) {
+        const { cx: sx, cy: sy } = toCanvas(stroke[pi]);
+        ctx.moveTo(sx + revealR, sy);
+        ctx.arc(sx, sy, revealR, 0, Math.PI * 2);
+      }
+      ptsLeft -= stroke.length;
     }
     ctx.clip();
 
-    // Рисуем символ через fillText внутри clip (шрифт ИДЕНТИЧЕН финалу)
+    // Рисуем финальный fillText внутри clip — шрифт НЕ МЕНЯЕТСЯ
     ctx.globalAlpha = 1;
     ctx.fillStyle = layer.color;
     ctx.fillText(ch, charStartX, py);
 
     ctx.restore(); // снимаем clip
 
-    // Подсказка пера — маленькая точка на конце (имитация кончика ручки)
-    if (drawnPts > 0 && drawnPts <= totalPts) {
-      const tip = penPath[drawnPts - 1];
-      const tipX = charStartX + (tip.x - offInfo.padX);
-      const tipY = py + (tip.y - offInfo.midY);
+    // ── Поверх рисуем линию пера для эффекта «чернила текут» ──
+    // Это тонкая линия по скелету, которая бежит впереди раскрытия
+    ctx.save();
+    ctx.strokeStyle = layer.color;
+    ctx.lineWidth = penW * 0.55;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.globalAlpha = 0.85;
+
+    let pts2Left = drawnF;
+    for (const stroke of strokes) {
+      if (pts2Left <= 0) break;
+      const visibleF = Math.min(stroke.length, pts2Left);
+      const visibleI = Math.floor(visibleF);
+      const frac = visibleF - visibleI; // дробная часть — для субпиксельной плавности
+
+      if (visibleI < 1) { pts2Left -= stroke.length; continue; }
+
       ctx.beginPath();
-      ctx.arc(tipX, tipY, Math.max(1.5, fs * 0.025), 0, Math.PI * 2);
+      const p0 = toCanvas(stroke[0]);
+      ctx.moveTo(p0.cx, p0.cy);
+      for (let pi = 1; pi <= visibleI && pi < stroke.length; pi++) {
+        const p = toCanvas(stroke[pi]);
+        ctx.lineTo(p.cx, p.cy);
+      }
+
+      // Субпиксельная интерполяция последней точки
+      if (frac > 0 && visibleI < stroke.length - 1) {
+        const pA = toCanvas(stroke[visibleI]);
+        const pB = toCanvas(stroke[Math.min(visibleI + 1, stroke.length - 1)]);
+        ctx.lineTo(pA.cx + (pB.cx - pA.cx) * frac, pA.cy + (pB.cy - pA.cy) * frac);
+      }
+      ctx.stroke();
+
+      pts2Left -= stroke.length;
+    }
+    ctx.restore();
+
+    // ── Кончик пера (точка) ──
+    {
+      let ptsT = drawnF;
+      let tipPt: { x: number; y: number } | null = null;
+      let tipFrac = 0;
+      for (const stroke of strokes) {
+        if (ptsT <= 0) break;
+        if (ptsT < stroke.length) {
+          const i = Math.floor(ptsT);
+          tipFrac = ptsT - i;
+          const pA = stroke[Math.min(i, stroke.length-1)];
+          const pB = stroke[Math.min(i+1, stroke.length-1)];
+          tipPt = { x: pA.x + (pB.x - pA.x) * tipFrac, y: pA.y + (pB.y - pA.y) * tipFrac };
+          break;
+        }
+        ptsT -= stroke.length;
+      }
+      if (tipPt) {
+        const { cx: tx, cy: ty } = toCanvas(tipPt);
+        ctx.beginPath();
+        ctx.arc(tx, ty, penW * 0.65, 0, Math.PI * 2);
+        ctx.fillStyle = layer.color;
+        ctx.globalAlpha = 0.9;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // ── Финальный blend: при curP > 0.88 подмешиваем чистый fillText ──
+    // Это сглаживает возможные артефакты скелета в конце
+    if (curP > 0.88) {
+      const blend = (curP - 0.88) / 0.12;
+      ctx.globalAlpha = blend;
       ctx.fillStyle = layer.color;
-      ctx.globalAlpha = 0.7;
-      ctx.fill();
+      ctx.fillText(ch, charStartX, py);
       ctx.globalAlpha = 1;
     }
   }
@@ -473,8 +611,8 @@ export default function Index() {
   // Animation loop
   const runAnimation = useCallback(() => {
     const maxChars = Math.max(...layersRef.current.map(l => l.text.length), 1);
-    // Для handwrite нужно больше кадров на символ — чтобы путь пера был плавным
-    const baseFrames = animStyleRef.current === "handwrite" ? 28 : 18;
+    // handwrite: больше кадров для плавной прорисовки скелета
+    const baseFrames = animStyleRef.current === "handwrite" ? 45 : 18;
     const framesPerChar = Math.round(baseFrames / speed);
     const totalFrames = maxChars * framesPerChar;
     let frame = 0;
@@ -613,9 +751,9 @@ export default function Index() {
     const name = file.name.replace(/\.[^.]+$/, "");
     new FontFace(name, `url(${url})`).load().then(loaded => {
       document.fonts.add(loaded);
-      // Сбрасываем кеши путей пера — они должны пересчитаться под новый шрифт
-      penPathCache.clear();
-      charOffscreenCache.clear();
+      // Сбрасываем кеши — пересчитаются под новый шрифт
+      strokeCache.clear();
+      offscreenCache.clear();
       setUploadedFont(name);
       setFontName(name);
       updateActiveLayer({ fontFamily: name });
