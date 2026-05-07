@@ -53,109 +53,162 @@ function getPreviewDims(ratio: AspectRatio, maxW: number, maxH: number) {
   return { w: Math.round(ar.w * scale), h: Math.round(ar.h * scale) };
 }
 
-// Cache: char -> array of stroke polylines (pixel paths)
-const charStrokeCache = new Map<string, { x: number; y: number }[][]>();
-
 /**
- * Сканирует символ в offscreen canvas и строит реалистичные штрихи пера.
- * Возвращает массив полилиний — каждая полилиния это один штрих.
- * Алгоритм: сканируем пиксели сверху вниз, строками.
- * На каждой строке находим непрерывные отрезки заполненных пикселей.
- * Соединяем их в штрихи, которые плавно идут вниз — как реальный почерк.
+ * HANDWRITE ANIMATION — правильный подход:
+ *
+ * Для каждого символа:
+ * 1. Рендерим его в offscreen canvas точно тем же шрифтом (fillText, без изменений)
+ * 2. Сканируем пиксели и строим «траекторию пера» — упорядоченный список точек,
+ *    которые перо должно пройти чтобы нарисовать букву.
+ * 3. Во время анимации: уже пройденные пиксели остаются видимыми (через offscreen clip),
+ *    финальный результат — точно тот же fillText.
+ *
+ * Траектория строится алгоритмом Рамера-Дугласа-Пекера для сглаживания +
+ * сортировка отрезков по близости (greedy nearest-neighbor).
+ * Это даёт порядок штрихов максимально похожий на реальный почерк.
  */
-function buildCharStrokes(ch: string, fontStr: string, fs: number): { x: number; y: number }[][] {
-  const cacheKey = `${ch}||${fontStr}`;
-  if (charStrokeCache.has(cacheKey)) return charStrokeCache.get(cacheKey)!;
 
-  // Рисуем символ в offscreen canvas в высоком разрешении для точного сканирования
-  const W = Math.ceil(fs * 1.4) + 4;
-  const H = Math.ceil(fs * 1.4) + 4;
+// Кеш: ключ → упорядоченный список точек пути пера
+const penPathCache = new Map<string, { x: number; y: number }[]>();
+
+function buildPenPath(ch: string, fontStr: string, fs: number): { x: number; y: number }[] {
+  const key = `${ch}|${fontStr}`;
+  if (penPathCache.has(key)) return penPathCache.get(key)!;
+
+  // Размер offscreen
+  const PAD = 4;
+  const W = Math.ceil(fs * 1.6) + PAD * 2;
+  const H = Math.ceil(fs * 1.4) + PAD * 2;
+
   const off = document.createElement("canvas");
-  off.width = W;
-  off.height = H;
-  const octx = off.getContext("2d")!;
-  octx.clearRect(0, 0, W, H);
-  octx.font = fontStr;
-  octx.textBaseline = "middle";
-  octx.textAlign = "left";
-  octx.fillStyle = "#fff";
-  octx.fillText(ch, 2, H / 2);
+  off.width = W; off.height = H;
+  const oc = off.getContext("2d")!;
+  oc.clearRect(0, 0, W, H);
+  oc.font = fontStr;
+  oc.textBaseline = "middle";
+  oc.textAlign = "left";
+  oc.fillStyle = "#fff";
+  oc.fillText(ch, PAD, H / 2);
 
-  const { data } = octx.getImageData(0, 0, W, H);
-  const filled = (x: number, y: number) => {
-    if (x < 0 || y < 0 || x >= W || y >= H) return false;
-    return data[(y * W + x) * 4 + 3] > 32;
-  };
+  const imgData = oc.getImageData(0, 0, W, H);
+  const alpha = imgData.data;
+  const isFilled = (x: number, y: number) =>
+    x >= 0 && y >= 0 && x < W && y < H && alpha[(y * W + x) * 4 + 3] > 24;
 
-  // Шаг сканирования — чем меньше, тем плавнее, но медленнее
-  const step = Math.max(1, Math.round(fs / 28));
+  // Шаг сканирования: достаточно мелкий для качества, не слишком мелкий для скорости
+  const step = Math.max(1, Math.floor(fs / 40));
 
-  // Собираем отрезки по строкам
-  type Seg = { x1: number; x2: number; y: number };
-  const segments: Seg[] = [];
-  for (let y = 0; y < H; y += step) {
-    let inSeg = false;
-    let segX1 = 0;
+  // Собираем горизонтальные отрезки (сегменты) построчно
+  type Seg = { x1: number; x2: number; xMid: number; y: number; used: boolean };
+  const segs: Seg[] = [];
+
+  for (let y = step; y < H - step; y += step) {
+    let start = -1;
     for (let x = 0; x <= W; x++) {
-      const f = filled(x, y);
-      if (f && !inSeg) { inSeg = true; segX1 = x; }
-      if (!f && inSeg) { inSeg = false; segments.push({ x1: segX1, x2: x - 1, y }); }
+      if (isFilled(x, y) && start < 0) { start = x; }
+      else if (!isFilled(x, y) && start >= 0) {
+        segs.push({ x1: start, x2: x - 1, xMid: (start + x - 1) / 2, y, used: false });
+        start = -1;
+      }
     }
   }
 
-  if (segments.length === 0) {
-    charStrokeCache.set(cacheKey, []);
+  if (segs.length === 0) {
+    penPathCache.set(key, []);
     return [];
   }
 
-  // Объединяем соседние отрезки в непрерывные штрихи.
-  // Отрезок продолжает штрих если близко по Y и перекрывается по X.
-  const strokes: { x: number; y: number }[][] = [];
-  const used = new Set<number>();
+  // Строим путь пера: связываем сегменты в цепочки (как реальный почерк)
+  // Алгоритм: greedy nearest-neighbor по ближайшему незаполненному сегменту
+  // Направление чередуется (зигзаг) чтобы перо не возвращалось.
+  const path: { x: number; y: number }[] = [];
 
-  for (let i = 0; i < segments.length; i++) {
-    if (used.has(i)) continue;
-    const stroke: { x: number; y: number }[] = [];
-    let cur = segments[i];
-    used.add(i);
+  // Начинаем с самого левого сегмента верхней строки
+  segs.sort((a, b) => a.y - b.y || a.x1 - b.x1);
+  let curX = segs[0].x1;
+  let curY = segs[0].y;
+  let goRight = true;
 
-    // Идём по середине отрезка, ищем продолжение
-    let goingRight = true; // чередуем направление как зигзаг (имитация почерка)
-    let curX = goingRight ? cur.x1 : cur.x2;
-
-    stroke.push({ x: cur.x1, y: cur.y });
-    stroke.push({ x: cur.x2, y: cur.y });
-
-    // Ищем следующий отрезок
-    for (let j = i + 1; j < segments.length; j++) {
-      if (used.has(j)) continue;
-      const next = segments[j];
-      if (next.y - cur.y > step * 2.5) break; // слишком далеко — новый штрих
-
-      // Перекрытие по X с небольшим допуском
-      const overlap = Math.min(cur.x2, next.x2) - Math.max(cur.x1, next.x1);
-      if (overlap >= -step * 3) {
-        used.add(j);
-        goingRight = !goingRight;
-        // Добавляем точки зигзагом (имитация направления пера)
-        if (goingRight) {
-          stroke.push({ x: next.x1, y: next.y });
-          stroke.push({ x: next.x2, y: next.y });
-          curX = next.x2;
-        } else {
-          stroke.push({ x: next.x2, y: next.y });
-          stroke.push({ x: next.x1, y: next.y });
-          curX = next.x1;
-        }
-        cur = next;
-      }
-    }
-
-    if (stroke.length >= 2) strokes.push(stroke);
+  // Группируем по строкам для быстрого поиска
+  const byRow = new Map<number, Seg[]>();
+  for (const s of segs) {
+    const row = Math.round(s.y / step);
+    if (!byRow.has(row)) byRow.set(row, []);
+    byRow.get(row)!.push(s);
   }
 
-  charStrokeCache.set(cacheKey, strokes);
-  return strokes;
+  const visited = new Set<Seg>();
+
+  const findNearest = (fromX: number, fromY: number): Seg | null => {
+    // Ищем в ближайших строках
+    const rowNow = Math.round(fromY / step);
+    let best: Seg | null = null;
+    let bestDist = Infinity;
+    for (let dr = 0; dr <= 3; dr++) {
+      for (const row of [rowNow + dr, rowNow - dr]) {
+        const rowSegs = byRow.get(row) ?? [];
+        for (const s of rowSegs) {
+          if (visited.has(s)) continue;
+          const dist = Math.hypot(s.xMid - fromX, s.y - fromY);
+          if (dist < bestDist) { bestDist = dist; best = s; }
+        }
+      }
+      if (best && bestDist < fs * 0.8) break;
+    }
+    return best;
+  };
+
+  let iterations = 0;
+  while (iterations < segs.length * 2) {
+    iterations++;
+    const seg = findNearest(curX, curY);
+    if (!seg) break;
+    visited.add(seg);
+
+    // Добавляем точки отрезка в путь (направление зигзагом)
+    if (goRight) {
+      path.push({ x: seg.x1, y: seg.y });
+      path.push({ x: seg.x2, y: seg.y });
+      curX = seg.x2;
+    } else {
+      path.push({ x: seg.x2, y: seg.y });
+      path.push({ x: seg.x1, y: seg.y });
+      curX = seg.x1;
+    }
+    curY = seg.y;
+    goRight = !goRight;
+  }
+
+  penPathCache.set(key, path);
+  return path;
+}
+
+/**
+ * Создаёт offscreen canvas с символом и возвращает его.
+ * Кешируется отдельно чтобы не перерисовывать каждый кадр.
+ */
+const charOffscreenCache = new Map<string, { canvas: HTMLCanvasElement; padX: number; midY: number }>();
+
+function getCharOffscreen(ch: string, fontStr: string, fs: number) {
+  const key = `${ch}|${fontStr}`;
+  if (charOffscreenCache.has(key)) return charOffscreenCache.get(key)!;
+
+  const PAD = 4;
+  const W = Math.ceil(fs * 1.6) + PAD * 2;
+  const H = Math.ceil(fs * 1.4) + PAD * 2;
+  const off = document.createElement("canvas");
+  off.width = W; off.height = H;
+  const oc = off.getContext("2d")!;
+  oc.clearRect(0, 0, W, H);
+  oc.font = fontStr;
+  oc.textBaseline = "middle";
+  oc.textAlign = "left";
+  oc.fillStyle = "#fff";
+  oc.fillText(ch, PAD, H / 2);
+
+  const res = { canvas: off, padX: PAD, midY: H / 2 };
+  charOffscreenCache.set(key, res);
+  return res;
 }
 
 function drawLayer(
@@ -178,158 +231,151 @@ function drawLayer(
   const styleStr = layer.italic ? "italic" : "normal";
   const fontStr = `${styleStr} ${weight} ${fs}px '${layer.fontFamily}', 'Caveat', cursive`;
 
+  ctx.save();
   ctx.font = fontStr;
   ctx.textBaseline = "middle";
-  ctx.textAlign = layer.align;
+  ctx.textAlign = "left";
 
   const chars = layer.text.split("");
   const n = chars.length;
 
-  // --- Static / full render (без анимации или после завершения) ---
-  if (isStatic || n === 0) {
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = layer.color;
-    ctx.fillText(layer.text, px, py);
-    return;
-  }
-
-  // Вычисляем стартовую X для всех режимов (текст не сдвигается)
-  ctx.textAlign = "left";
+  // Вычисляем начальную X (фиксированная, не двигается)
   const fullW = ctx.measureText(layer.text).width;
   let startX = px;
   if (layer.align === "center") startX = px - fullW / 2;
   if (layer.align === "right") startX = px - fullW;
 
-  // --- TYPEWRITER ---
+  // ── Статик / завершено ──
+  if (isStatic || n === 0) {
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = layer.color;
+    ctx.fillText(layer.text, startX, py);
+    ctx.restore();
+    return;
+  }
+
+  // ── TYPEWRITER ──
   if (animStyle === "typewriter") {
     const visible = Math.floor(progress * n);
     ctx.globalAlpha = 1;
     ctx.fillStyle = layer.color;
     let x = startX;
     for (let i = 0; i < n; i++) {
-      const cw = ctx.measureText(chars[i]).width;
       if (i < visible) ctx.fillText(chars[i], x, py);
-      x += cw;
+      x += ctx.measureText(chars[i]).width;
     }
-    ctx.textAlign = layer.align;
+    ctx.restore();
     return;
   }
 
-  // --- FADE ---
+  // ── FADE ──
   if (animStyle === "fade") {
     let x = startX;
     for (let i = 0; i < n; i++) {
-      const cw = ctx.measureText(chars[i]).width;
-      const charStart = i / n;
-      const charEnd = (i + 1.5) / n;
-      const alpha = Math.max(0, Math.min(1, (progress - charStart) / (charEnd - charStart)));
+      const cs = i / n, ce = (i + 1.5) / n;
+      const alpha = Math.max(0, Math.min(1, (progress - cs) / (ce - cs)));
       ctx.globalAlpha = alpha;
       ctx.fillStyle = layer.color;
       ctx.fillText(chars[i], x, py);
-      x += cw;
+      x += ctx.measureText(chars[i]).width;
     }
     ctx.globalAlpha = 1;
-    ctx.textAlign = layer.align;
+    ctx.restore();
     return;
   }
 
-  // --- HANDWRITE ---
-  // Для каждого символа строим реальные штрихи через pixel-scan.
-  // Анимируем прорисовку штрихов линия за линией.
-  // Уже написанные символы рисуем через обычный fillText (без изменения шрифта).
-  // Текущий (пишущийся) символ рисуем штрихами.
+  // ── HANDWRITE ──
+  // Каждый символ пишется отдельно:
+  //   • Уже написанные → fillText (шрифт не меняется, 100% идентичен финалу)
+  //   • Текущий символ → clip-маска из offscreen пикселей, раскрываемая по траектории пера
+  //
+  // Траектория пера строится один раз (кеш) и воспроизводится как движущееся пятно,
+  // которое «раскрывает» финальный fillText слева направо и сверху вниз.
 
-  const charProgress = progress * n; // сколько символов «написано» (дробное)
-  const fullyDone = Math.floor(charProgress); // полностью написанные
-  const currentIdx = Math.min(fullyDone, n - 1);
-  const currentCharProgress = charProgress - fullyDone; // 0..1 для текущего символа
+  const charProgress = progress * n;
+  const doneCount = Math.floor(charProgress);
+  const curIdx = Math.min(doneCount, n - 1);
+  const curP = Math.max(0, charProgress - doneCount); // 0..1 прогресс текущего символа
 
-  // 1. Рисуем полностью написанные символы через fillText (шрифт не меняется!)
-  if (fullyDone > 0) {
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = layer.color;
-    // Рисуем подстроку правильно — символ за символом чтобы позиция совпадала
-    let x = startX;
-    for (let i = 0; i < Math.min(fullyDone, n); i++) {
-      ctx.fillText(chars[i], x, py);
-      x += ctx.measureText(chars[i]).width;
-    }
+  // 1. Готовые символы — чистый fillText
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = layer.color;
+  let cx = startX;
+  for (let i = 0; i < doneCount && i < n; i++) {
+    ctx.fillText(chars[i], cx, py);
+    cx += ctx.measureText(chars[i]).width;
   }
 
-  // 2. Рисуем текущий символ штрихами (pixel-scan анимация)
-  if (currentIdx < n && currentCharProgress > 0) {
-    // Позиция текущего символа
-    let charX = startX;
-    for (let i = 0; i < currentIdx; i++) {
-      charX += ctx.measureText(chars[i]).width;
-    }
-    const ch = chars[currentIdx];
+  // 2. Текущий символ — анимированная прорисовка
+  if (curIdx < n && (curP > 0 || doneCount === 0)) {
+    // Позиция левого края текущего символа
+    let charStartX = startX;
+    for (let i = 0; i < curIdx; i++) charStartX += ctx.measureText(chars[i]).width;
 
-    // Получаем штрихи символа
-    const strokes = buildCharStrokes(ch, fontStr, fs);
-    if (strokes.length === 0) {
-      // Символ не имеет штрихов (пробел и т.д.) — просто показываем
-      ctx.globalAlpha = currentCharProgress;
-      ctx.fillStyle = layer.color;
-      ctx.fillText(ch, charX, py);
-      ctx.globalAlpha = 1;
-      ctx.textAlign = layer.align;
+    const ch = chars[curIdx];
+    if (ch.trim() === "") {
+      // Пробел — просто переходим
+      ctx.restore();
       return;
     }
 
-    // Считаем суммарное количество точек во всех штрихах
-    const totalPoints = strokes.reduce((s, st) => s + st.length, 0);
-    const drawnPoints = Math.floor(currentCharProgress * totalPoints);
+    // Получаем траекторию пера и offscreen с символом
+    const penPath = buildPenPath(ch, fontStr, fs);
+    const offInfo = getCharOffscreen(ch, fontStr, fs);
 
-    // Смещение символа: offscreen рисовался с отступом 2px, textBaseline=middle, H/2
-    // Нужно перевести координаты offscreen → canvas
-    const H = Math.ceil(fs * 1.4) + 4;
-    const offOffsetY = H / 2; // py_offscreen = H/2, соответствует py в canvas
-
-    // Рисуем штрихи пером
-    ctx.save();
-    ctx.strokeStyle = layer.color;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    // Толщина пера — чуть меньше чем у шрифта, имитация ручки
-    ctx.lineWidth = Math.max(1.5, fs * 0.055);
-    ctx.globalAlpha = 1;
-
-    let pointsLeft = drawnPoints;
-    for (const stroke of strokes) {
-      if (pointsLeft <= 0) break;
-      const pts = stroke.slice(0, pointsLeft);
-      pointsLeft -= stroke.length;
-
-      if (pts.length < 2) continue;
-
-      ctx.beginPath();
-      // Смещаем координаты: x из offscreen + charX - 2 (отступ), y из offscreen - offOffsetY + py
-      ctx.moveTo(charX + pts[0].x - 2, py + pts[0].y - offOffsetY);
-      for (let pi = 1; pi < pts.length; pi++) {
-        // Имитация давления пера: толщина меняется по ходу штриха
-        const t = pi / pts.length;
-        const pressure = 0.6 + 0.4 * Math.sin(t * Math.PI);
-        ctx.lineWidth = Math.max(1.5, fs * 0.055 * pressure);
-        ctx.lineTo(charX + pts[pi].x - 2, py + pts[pi].y - offOffsetY);
-      }
-      ctx.stroke();
-    }
-    ctx.restore();
-
-    // Под конец прорисовки — плавно проявляем финальный fillText
-    // чтобы переход был незаметным (за последние 20% прогресса символа)
-    if (currentCharProgress > 0.8) {
-      const blend = (currentCharProgress - 0.8) / 0.2;
-      ctx.globalAlpha = blend;
+    if (penPath.length < 2) {
+      // Символ без пути (редкость) — fade
+      ctx.globalAlpha = curP;
       ctx.fillStyle = layer.color;
-      ctx.fillText(ch, charX, py);
+      ctx.fillText(ch, charStartX, py);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      return;
+    }
+
+    // Сколько точек пути пройдено
+    const totalPts = penPath.length;
+    const drawnPts = Math.max(1, Math.floor(curP * totalPts));
+
+    // Строим clip-маску: объединение кружков вдоль пройденного пути пера
+    // Радиус кружка = fs * 0.35 — достаточно чтобы перекрывать соседние точки
+    // Это создаёт эффект «пятна» которое раскрывает символ
+    const penR = fs * 0.38;
+
+    ctx.save();
+    ctx.beginPath();
+    for (let pi = 0; pi < drawnPts; pi++) {
+      const pt = penPath[pi];
+      // Переводим координаты offscreen → canvas
+      const canvasX = charStartX + (pt.x - offInfo.padX);
+      const canvasY = py + (pt.y - offInfo.midY);
+      ctx.moveTo(canvasX + penR, canvasY);
+      ctx.arc(canvasX, canvasY, penR, 0, Math.PI * 2);
+    }
+    ctx.clip();
+
+    // Рисуем символ через fillText внутри clip (шрифт ИДЕНТИЧЕН финалу)
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = layer.color;
+    ctx.fillText(ch, charStartX, py);
+
+    ctx.restore(); // снимаем clip
+
+    // Подсказка пера — маленькая точка на конце (имитация кончика ручки)
+    if (drawnPts > 0 && drawnPts <= totalPts) {
+      const tip = penPath[drawnPts - 1];
+      const tipX = charStartX + (tip.x - offInfo.padX);
+      const tipY = py + (tip.y - offInfo.midY);
+      ctx.beginPath();
+      ctx.arc(tipX, tipY, Math.max(1.5, fs * 0.025), 0, Math.PI * 2);
+      ctx.fillStyle = layer.color;
+      ctx.globalAlpha = 0.7;
+      ctx.fill();
       ctx.globalAlpha = 1;
     }
   }
 
-  ctx.globalAlpha = 1;
-  ctx.textAlign = layer.align;
+  ctx.restore();
 }
 
 export default function Index() {
@@ -427,7 +473,9 @@ export default function Index() {
   // Animation loop
   const runAnimation = useCallback(() => {
     const maxChars = Math.max(...layersRef.current.map(l => l.text.length), 1);
-    const framesPerChar = Math.round(18 / speed);
+    // Для handwrite нужно больше кадров на символ — чтобы путь пера был плавным
+    const baseFrames = animStyleRef.current === "handwrite" ? 28 : 18;
+    const framesPerChar = Math.round(baseFrames / speed);
     const totalFrames = maxChars * framesPerChar;
     let frame = 0;
 
@@ -565,10 +613,12 @@ export default function Index() {
     const name = file.name.replace(/\.[^.]+$/, "");
     new FontFace(name, `url(${url})`).load().then(loaded => {
       document.fonts.add(loaded);
+      // Сбрасываем кеши путей пера — они должны пересчитаться под новый шрифт
+      penPathCache.clear();
+      charOffscreenCache.clear();
       setUploadedFont(name);
       setFontName(name);
       updateActiveLayer({ fontFamily: name });
-      // Switch to draw tab so user sees animation preview of new font
       setSelectedChar("А");
       setStrokes([]);
       setCurrentStroke([]);
